@@ -3647,6 +3647,113 @@ class TestModels(unittest.TestCase):
         output = model(input_ids_with_img, pixel_values=pixel_values)
         self.assertEqual(output.logits.shape, (1, 6, config.text_config.vocab_size))
 
+    def test_gemma4_mlx_format_kv_shared_load(self):
+        """Regression: mlx-format checkpoints built before the kv-sharing structural
+        refactor (mlx-vlm 0.6.2) contain k_proj/v_proj/k_norm/v_norm for *every*
+        layer.  With the is_mlx_format guard in place, LanguageModel.sanitize() was
+        skipped and load_weights raised "parameters not in model".
+
+        This test verifies that load_model() handles such "stale" mlx-format
+        checkpoints cleanly by always running LanguageModel.sanitize().
+        """
+        import json
+        import tempfile
+        from pathlib import Path
+
+        import mlx.core as mx
+        from mlx.utils import tree_flatten
+
+        from mlx_vlm.models import gemma4
+        from mlx_vlm.utils import load_model, save_config
+
+        # Minimal 4-layer gemma4 config; layers 2-3 are kv-shared.
+        text_config = gemma4.TextConfig(
+            model_type="gemma4_text",
+            hidden_size=16,
+            num_hidden_layers=4,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            global_head_dim=8,
+            vocab_size=32,
+            vocab_size_per_layer_input=32,
+            hidden_size_per_layer_input=8,
+            num_kv_shared_layers=2,
+            sliding_window=32,
+            sliding_window_pattern=2,
+        )
+        vision_config = gemma4.VisionConfig(
+            model_type="gemma4_vision",
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            patch_size=16,
+            pooling_kernel_size=1,
+            default_output_length=4,
+            position_embedding_size=64,
+            use_clipped_linears=False,
+        )
+        model_config = gemma4.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="gemma4",
+            vocab_size=text_config.vocab_size,
+            image_token_id=31,
+        )
+        model = gemma4.Model(model_config)
+
+        # Collect current (correct, post-refactor) weights.
+        weights = dict(tree_flatten(model.parameters()))
+
+        # Inject stale kv-shared weights that a pre-0.6.2 checkpoint would have.
+        # Layers 2 and 3 (first_kv_shared = num_hidden_layers - num_kv_shared = 2)
+        # no longer own k/v projections in the current model, but an old mlx-format
+        # checkpoint would still contain them.
+        kv_heads, head_dim, hidden = 1, 8, 16
+        for layer_idx in (2, 3):
+            pfx = f"language_model.model.layers.{layer_idx}.self_attn"
+            weights[f"{pfx}.k_proj.weight"] = mx.zeros((kv_heads * head_dim, hidden))
+            weights[f"{pfx}.v_proj.weight"] = mx.zeros((kv_heads * head_dim, hidden))
+            weights[f"{pfx}.k_norm.weight"] = mx.zeros((head_dim,))
+            weights[f"{pfx}.v_norm.weight"] = mx.zeros((head_dim,))
+
+        with tempfile.TemporaryDirectory() as model_dir:
+            model_path = Path(model_dir)
+
+            # Write as a single mlx-format safetensors file.
+            mx.save_safetensors(
+                str(model_path / "model.safetensors"),
+                weights,
+                metadata={"format": "mlx"},
+            )
+            save_config(
+                {
+                    "model_type": "gemma4",
+                    "vocab_size": text_config.vocab_size,
+                    "image_token_id": model_config.image_token_id,
+                    "text_config": vars(text_config).copy(),
+                    "vision_config": vars(vision_config).copy(),
+                    # Explicitly null — prevents load_model's setdefault({}) from
+                    # inflating this to a full 12-layer AudioConfig with missing weights.
+                    "audio_config": None,
+                },
+                model_path / "config.json",
+            )
+
+            # Before the fix this raised:
+            #   ValueError: … parameters not in model …  (k_proj/v_proj for layers 2-3)
+            # After the fix, LanguageModel.sanitize() strips the stale keys regardless
+            # of the is_mlx_format flag.
+            loaded = load_model(model_path)
+
+        output = loaded(mx.array([[0, 1, 2]], dtype=mx.int32))
+        self.assertEqual(output.logits.shape, (1, 3, text_config.vocab_size))
+
     def test_deepseekocr(self):
         from mlx_vlm.models import deepseekocr
 

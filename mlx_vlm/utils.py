@@ -479,6 +479,7 @@ def load_model(model_path: Path, lazy: bool = False, **kwargs) -> nn.Module:
         FileNotFoundError: If the weight files (.safetensors) are not found.
         ValueError: If the model class or args class are not found or cannot be instantiated.
     """
+    strict = kwargs.pop("strict", True)
     config = load_config(model_path, **kwargs)
 
     # Find all .safetensors files in the model_path, excluding consolidated model weights
@@ -550,7 +551,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization_config"] = transformed_quantization
 
     if not is_mlx_format:
-        # Sanitize weights
+        # Sanitize weights: rename/reshape HF-format keys and drop conversion
+        # artifacts.  These transforms are only needed when converting from a
+        # non-mlx checkpoint — mlx-format checkpoints are already in the right
+        # shape for the *version of the code that created them*, so we skip the
+        # top-level and vision/audio sanitize passes for those.
         weights = sanitize_weights(model, weights)
 
         if hasattr(model, "thinker") and hasattr(model.thinker, "sanitize"):
@@ -565,14 +570,29 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 weights = sanitize_weights(
                     model_class.VisionModel, weights, model_config.vision_config
                 )
-            if hasattr(model_class, "LanguageModel"):
-                weights = sanitize_weights(
-                    model_class.LanguageModel, weights, model_config.text_config
-                )
             if hasattr(model_class, "AudioModel"):
                 weights = sanitize_weights(
                     model_class.AudioModel, weights, model_config.audio_config
                 )
+
+    # Always run LanguageModel.sanitize, regardless of checkpoint format.
+    #
+    # LanguageModel.sanitize() handles *structural* model changes — parameters
+    # that exist in a checkpoint built against an older code version but are no
+    # longer present in the current model graph.  The canonical example is the
+    # Gemma 4 kv-sharing refactor (mlx-vlm 0.6.2): pre-refactor checkpoints
+    # store k_proj/v_proj/k_norm/v_norm for every layer; post-refactor the
+    # kv-shared layers (indices >= num_hidden_layers - num_kv_shared_layers)
+    # no longer create those projections.  Without this pass, loading an
+    # mlx-community checkpoint built before the refactor raises
+    # "parameters not in model" even though the checkpoint itself is correct.
+    #
+    # VisionModel/AudioModel/top-level sanitize stays format-gated above because
+    # those transforms exist solely to rename/reshape HF weights at convert time.
+    if not hasattr(model, "thinker") and hasattr(model_class, "LanguageModel"):
+        weights = sanitize_weights(
+            model_class.LanguageModel, weights, model_config.text_config
+        )
 
     if not has_quantization:
         quantization_config = config.get("quantization_config", None)
@@ -655,7 +675,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
         mx.eval(model.parameters())
