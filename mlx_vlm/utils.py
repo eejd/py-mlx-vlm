@@ -25,7 +25,7 @@ from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
-from .tokenizer_utils import load_tokenizer
+from .tokenizer_utils import NaiveStreamingDetokenizer, load_tokenizer
 from .trainer.utils import apply_lora_layers
 
 logger = logging.getLogger(__name__)
@@ -1271,6 +1271,9 @@ def update_module_configs(model_config, model_class, config, modules):
     return model_config
 
 
+_MODEL_ONLY_LOAD_KWARGS = ("quantize_activations", "expert_cache_gb", "max_kv_size")
+
+
 def load(
     path_or_hf_repo: str,
     adapter_path: Optional[str] = None,
@@ -1315,12 +1318,22 @@ def load(
         model = apply_lora_layers(model, adapter_path)
         model.eval()
 
-    image_processor = load_image_processor(model_path, **kwargs)
+    # Options consumed by load_model only. They are not Hugging Face loader
+    # arguments: a strict tokenizer (MistralCommonBackend, used for tekken
+    # checkpoints such as Devstral) rejects them, and AutoProcessor then
+    # silently falls back to a bare image processor.
+    processor_kwargs = {
+        k: v for k, v in kwargs.items() if k not in _MODEL_ONLY_LOAD_KWARGS
+    }
+
+    image_processor = load_image_processor(model_path, **processor_kwargs)
 
     # Get the eos_token_id from the model config
     eos_token_id = getattr(model.config, "eos_token_id", None)
 
-    processor = load_processor(model_path, True, eos_token_ids=eos_token_id, **kwargs)
+    processor = load_processor(
+        model_path, True, eos_token_ids=eos_token_id, **processor_kwargs
+    )
 
     if image_processor is not None:
         processor.image_processor = image_processor
@@ -1478,7 +1491,14 @@ def load_processor(
         try:
             processor.detokenizer = detokenizer_class(tokenizer_obj)
         except AttributeError:
-            return processor
+            # The BPE and SPM streaming detokenizers read `tokenizer.vocab`.
+            # Backends that only expose get_vocab() (transformers'
+            # MistralCommonBackend, used for tekken checkpoints such as
+            # Devstral) decode through the tokenizer instead.
+            try:
+                processor.detokenizer = NaiveStreamingDetokenizer(tokenizer_obj)
+            except AttributeError:
+                return processor
 
         # Create and assign the StoppingCriteria
         criteria = StoppingCriteria(

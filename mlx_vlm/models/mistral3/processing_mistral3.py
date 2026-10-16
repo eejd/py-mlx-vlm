@@ -5,6 +5,7 @@ Mistral3 uses the same processor architecture as Pixtral.
 Adapted from HuggingFace Transformers.
 """
 
+import logging
 from typing import List, Optional, Union
 
 from transformers.feature_extraction_utils import BatchFeature
@@ -19,12 +20,80 @@ from ..pixtral.image_processing_pixtral import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
 def is_url(val) -> bool:
     return isinstance(val, str) and val.startswith("http")
 
 
 def is_image_or_image_url(elem):
     return is_url(elem) or is_valid_image(elem)
+
+
+_TOKENIZER_JSON_PROBES = (
+    "Hello, world!",
+    "  leading and  double  spaces",
+    "def f(x):\n    return x + 1\n",
+    "h\u00e9llo w\u00f6rld \u4f60\u597d \U0001f389",
+    "12345 67890",
+    "<tag>&amp;</tag>",
+    "a\tb\r\nc",
+    "The quick brown fox's tail.\n\n\nEnd",
+    "https://example.com/a?b=c#d",
+    '{"text": "hi", "n": [1, 2, 3]}',
+)
+
+
+def _prefer_tokenizer_json(tokenizer, model_path, **kwargs):
+    """Replace transformers' MistralCommonBackend by the tokenizer.json tokenizer.
+
+    transformers 5.x loads any checkpoint that ships tekken.json as a
+    MistralCommonBackend, which encodes a rendered chat string as plain text:
+    ``<s>``, ``[INST]``, ``[TOOL_CALLS]`` and ``[IMG]`` become ordinary
+    characters instead of control tokens, and the backend lacks the ``vocab``
+    attribute the streaming detokenizers read. The tokenizer.json tokenizer
+    encodes the control tokens. It is used only if it decodes every id and
+    encodes the probe strings exactly as the backend does; otherwise the
+    backend is kept.
+    """
+    if type(tokenizer).__name__ != "MistralCommonBackend":
+        return tokenizer
+
+    from transformers import AutoTokenizer
+
+    try:
+        fast = AutoTokenizer.from_pretrained(
+            model_path, mistral_format=False, fix_mistral_regex=True, **kwargs
+        )
+    except Exception as e:
+        logger.warning("Keeping MistralCommonBackend, tokenizer.json failed: %s", e)
+        return tokenizer
+
+    size = len(tokenizer)
+    ids = [[i] for i in range(size)]
+    try:
+        same = (
+            getattr(fast, "is_fast", False)
+            and len(fast) == size
+            and fast.bos_token_id == tokenizer.bos_token_id
+            and fast.eos_token_id == tokenizer.eos_token_id
+            and fast.batch_decode(ids, skip_special_tokens=False)
+            == tokenizer.batch_decode(ids, skip_special_tokens=False)
+            and all(
+                fast.encode(text, add_special_tokens=False)
+                == tokenizer.encode(text, add_special_tokens=False)
+                for text in _TOKENIZER_JSON_PROBES
+            )
+        )
+    except Exception as e:
+        logger.warning("Keeping MistralCommonBackend, comparison failed: %s", e)
+        return tokenizer
+    if not same:
+        logger.warning("Keeping MistralCommonBackend, tokenizer.json differs from it")
+        return tokenizer
+    logger.info("Using the tokenizer.json tokenizer instead of MistralCommonBackend")
+    return fast
 
 
 def _load_mistral3_image_processor(pretrained_model_name_or_path, **kwargs):
@@ -183,6 +252,7 @@ class Mistral3Processor(ProcessorMixin):
         )
 
         tokenizer = AutoTokenizer.from_pretrained(resolved_model_path, **kwargs)
+        tokenizer = _prefer_tokenizer_json(tokenizer, resolved_model_path, **kwargs)
         load_chat_template(tokenizer, resolved_model_path)
 
         def _load_json_config(filename):
