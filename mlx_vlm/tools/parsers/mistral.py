@@ -1,4 +1,5 @@
-# Vendored from mlx-lm 0.31.3 (mlx_lm/tool_parsers/mistral.py).
+# Vendored from mlx-lm 0.32.0 (mlx_lm/tool_parsers/mistral.py): parallel calls
+# (``a[ARGS]{..}[TOOL_CALLS]b[ARGS]{..}``) are returned as a list.
 # Copyright © 2026 Apple Inc.
 
 import json
@@ -6,27 +7,62 @@ from typing import Any
 
 import regex as re
 
-# Mistral emits two official tool-call shapes after the [TOOL_CALLS] marker:
-#   - v11/tekken tokenizer: ``name[ARGS]{json}`` (Mistral-Small-3.x, Devstral)
-#   - classic v3 tokenizer: a JSON array ``[{"name": ..., "arguments": ...}]``
-#     (Mistral-7B-v0.3, Mixtral, Ministral-8B)
-_tool_call_regex = re.compile(r"\s*(\w+)\[ARGS\]\s*(\{.*\})", re.DOTALL)
+# Matches a "name[ARGS]" header, ending where the JSON arguments start.
+_tool_call_header_regex = re.compile(r"([\w-]+)\s*\[ARGS\]\s*")
 
 tool_call_start = "[TOOL_CALLS]"
 tool_call_end = ""
 
 
-def parse_tool_call(text: str, tools: Any | None = None):
-    match = _tool_call_regex.search(text)
-    if match is not None:
-        return dict(name=match.group(1), arguments=json.loads(match.group(2)))
-
+def _parse_json_calls(text: str) -> list[dict[str, Any]]:
+    """Parse `[{"name": ..., "arguments": ...}]`, raising if it is JSON but
+    not a tool call, so it cannot fall through to the header parser."""
     try:
-        parsed = json.loads(text.strip())
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Could not parse tool call from: {text}") from exc
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    calls = []
+    for call in payload:
+        name = call.get("name") if isinstance(call, dict) else None
+        arguments = call.get("arguments", {}) if isinstance(call, dict) else None
+        if isinstance(arguments, str):
+            # Some templates render the arguments as a JSON string.
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                arguments = None
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            raise ValueError(f"Could not parse tool call from: {text}")
+        parsed = dict(name=name, arguments=arguments)
+        if isinstance(call.get("id"), str):
+            # The server prefers the model's id over a fresh uuid.
+            parsed["id"] = call["id"]
+        calls.append(parsed)
+    return calls
 
-    calls = parsed if isinstance(parsed, list) else [parsed]
-    if calls and all(isinstance(c, dict) and "name" in c for c in calls):
-        return [dict(name=c["name"], arguments=c.get("arguments", {})) for c in calls]
-    raise ValueError(f"Could not parse tool call from: {text}")
+
+def _parse_header_calls(text: str) -> list[dict[str, Any]]:
+    """Parse `name[ARGS]{...}`, which can repeat. The template always renders
+    valid JSON, so a decode failure means generation was cut short."""
+    # raw_decode reads exactly one JSON value and reports where it ended.
+    decoder = json.JSONDecoder()
+    calls = []
+    pos = 0
+    while (match := _tool_call_header_regex.search(text, pos)) is not None:
+        pos = match.end()
+        try:
+            arguments, pos = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Could not parse tool call from: {text}") from e
+        calls.append(dict(name=match.group(1), arguments=arguments))
+    return calls
+
+
+def parse_tool_call(text: str, tools: Any | None = None):
+    # Mistral has no tool-call end token, so the text can hold several calls.
+    calls = _parse_json_calls(text) or _parse_header_calls(text)
+    if not calls:
+        raise ValueError(f"Could not parse tool call from: {text}")
+    return calls[0] if len(calls) == 1 else calls
