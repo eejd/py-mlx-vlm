@@ -684,7 +684,7 @@ def _prepare_generation_inputs(model, processor, prompt, image, audio, video, kw
         image_token_index=getattr(model.config, "image_token_index", None),
         resize_shape=resize_shape,
         add_special_tokens=should_add_special_tokens(
-            model.config.model_type, processor
+            model.config.model_type, processor, prompt
         ),
         **kwargs,
     )

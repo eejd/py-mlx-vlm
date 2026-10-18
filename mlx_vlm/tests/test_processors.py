@@ -2752,3 +2752,68 @@ class TestVideoMetadataForwarding:
             prepare_inputs(processor, videos=["clip.mp4"], prompts="Describe this.")
         assert "video_metadata" not in processor.kwargs
         assert processor.fps == [metadata.sampled_fps]
+
+
+class TestChatTemplateBos:
+    """A rendered chat prompt that already starts with BOS must not get a second one."""
+
+    BOS = "<|begin_of_text|>"
+
+    @pytest.fixture
+    def tokenizer(self):
+        # Llama-3-like: the tokenizer prepends BOS when add_special_tokens=True.
+        from tokenizers.processors import TemplateProcessing
+
+        tokens = ("[UNK]", "[PAD]", self.BOS, "hello", "world")
+        tok = fast_tokenizer(tokens, bos_token=self.BOS)
+        tok.backend_tokenizer.post_processor = TemplateProcessing(
+            single=f"{self.BOS} $A", special_tokens=[(self.BOS, 2)]
+        )
+        return tok
+
+    @staticmethod
+    def _generator(tokenizer, model_type="llama"):
+        from mlx_vlm.server.generation import ResponseGenerator
+
+        stub = SimpleNamespace(
+            processor=tokenizer,
+            model=SimpleNamespace(config=SimpleNamespace(model_type=model_type)),
+        )
+        return lambda prompt: ResponseGenerator._cpu_preprocess(stub, prompt)[
+            "input_ids"
+        ][0].tolist()
+
+    def test_server_prompt_with_template_bos_has_one_bos(self, tokenizer):
+        ids = self._generator(tokenizer)(f"{self.BOS}hello world")
+        assert ids == [2, 3, 4]
+
+    def test_server_prompt_without_template_bos_still_gets_one(self, tokenizer):
+        ids = self._generator(tokenizer)("hello world")
+        assert ids == [2, 3, 4]
+
+    def test_server_matches_tokenizer_with_special_tokens_disabled(self, tokenizer):
+        prompt = f"{self.BOS}hello world"
+        assert self._generator(tokenizer)(prompt) == tokenizer.encode(
+            prompt, add_special_tokens=False
+        )
+
+    def test_should_add_special_tokens_detects_template_bos(self, tokenizer):
+        assert not should_add_special_tokens("llama", tokenizer, f"{self.BOS}hello")
+        assert should_add_special_tokens("llama", tokenizer, "hello")
+        assert should_add_special_tokens("llama", tokenizer)
+
+    def test_should_add_special_tokens_batches_need_bos_on_every_prompt(
+        self, tokenizer
+    ):
+        with_bos = f"{self.BOS}hello"
+        assert not should_add_special_tokens("llama", tokenizer, [with_bos, with_bos])
+        assert should_add_special_tokens("llama", tokenizer, [with_bos, "hello"])
+
+    def test_tokenizer_without_bos_token_is_unaffected(self):
+        tok = fast_tokenizer()
+        assert tok.bos_token is None
+        assert should_add_special_tokens("llama", tok, "hello")
+
+    def test_processor_wrapping_the_tokenizer_is_supported(self, tokenizer):
+        processor = SimpleNamespace(tokenizer=tokenizer)
+        assert not should_add_special_tokens("llama", processor, f"{self.BOS}hello")

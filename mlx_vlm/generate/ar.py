@@ -3467,7 +3467,9 @@ def _generate_batch(
         for i, prompt in enumerate(prompts)
     ]
 
-    add_special_tokens = should_add_special_tokens(model.config.model_type, processor)
+    add_special_tokens = should_add_special_tokens(
+        model.config.model_type, processor, formatted_prompts
+    )
 
     resize_shape = normalize_resize_shape(kwargs.pop("resize_shape", None))
     image_token_index = getattr(model.config, "image_token_index", None)
