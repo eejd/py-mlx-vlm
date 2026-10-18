@@ -2817,3 +2817,59 @@ class TestChatTemplateBos:
     def test_processor_wrapping_the_tokenizer_is_supported(self, tokenizer):
         processor = SimpleNamespace(tokenizer=tokenizer)
         assert not should_add_special_tokens("llama", processor, f"{self.BOS}hello")
+
+
+class TestChatTemplateBosGenerateCallSites:
+    """`generate` call sites must forward the BOS-aware `add_special_tokens` decision."""
+
+    BOS = "<|begin_of_text|>"
+
+    class _Stop(Exception):
+        pass
+
+    @staticmethod
+    def _processor():
+        tok = SimpleNamespace(bos_token="<|begin_of_text|>")
+        return SimpleNamespace(tokenizer=tok)
+
+    @pytest.mark.parametrize(
+        ("rendered", "expected"),
+        [("<|begin_of_text|>hi", False), ("hi", True)],
+    )
+    def test_generate_batch_tokenization(self, rendered, expected):
+        from mlx_vlm.generate import ar
+
+        seen = {}
+
+        def fake_prepare(*args, **kwargs):
+            seen.update(kwargs)
+            raise self._Stop
+
+        model = SimpleNamespace(config=SimpleNamespace(model_type="llama"))
+        with (
+            patch.object(ar, "apply_chat_template", return_value=rendered),
+            patch.object(ar, "prepare_inputs", side_effect=fake_prepare),
+            pytest.raises(self._Stop),
+        ):
+            ar._generate_batch(model, self._processor(), ["hi"], max_tokens=1)
+        assert seen["add_special_tokens"] is expected
+
+    @pytest.mark.parametrize(
+        ("rendered", "expected"),
+        [("<|begin_of_text|>hi", False), ("hi", True)],
+    )
+    def test_prepare_generation_inputs_tokenization(self, rendered, expected):
+        from mlx_vlm.generate import dispatch
+
+        seen = {}
+
+        def fake_prepare(*args, **kwargs):
+            seen.update(kwargs)
+            return {"input_ids": mx.array([[1]])}
+
+        model = SimpleNamespace(config=SimpleNamespace(model_type="llama"))
+        with patch.object(dispatch, "prepare_inputs", side_effect=fake_prepare):
+            dispatch._prepare_generation_inputs(
+                model, self._processor(), rendered, None, None, None, {}
+            )
+        assert seen["add_special_tokens"] is expected
