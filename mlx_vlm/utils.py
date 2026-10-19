@@ -2836,8 +2836,30 @@ def print_array_report(t: mx.array, label: Optional[str]) -> dict:
     return report
 
 
-def should_add_special_tokens(model_type: str, processor) -> bool:
-    """Return whether tokenization should add markers outside the chat template."""
+def prompt_starts_with_bos(prompt, processor) -> bool:
+    """Return True when every rendered prompt already begins with the tokenizer's BOS text.
+
+    Chat templates such as Llama 3's start with ``{{ bos_token }}``; tokenizing the rendered
+    string with ``add_special_tokens=True`` then prepends a second BOS id.
+    """
+    tokenizer = getattr(processor, "tokenizer", processor)
+    bos_token = getattr(tokenizer, "bos_token", None)
+    if not bos_token or prompt is None:
+        return False
+    prompts = prompt if isinstance(prompt, (list, tuple)) else [prompt]
+    return bool(prompts) and all(
+        isinstance(p, str) and p.startswith(bos_token) for p in prompts
+    )
+
+
+def should_add_special_tokens(model_type: str, processor, prompt=None) -> bool:
+    """Return whether tokenization should add markers outside the chat template.
+
+    ``prompt`` is the rendered prompt(s) about to be tokenized. When it already starts
+    with the tokenizer's BOS the template owns it and no second one may be added.
+    """
+    if prompt_starts_with_bos(prompt, processor):
+        return False
     template_owns_markers = {
         "gemma3",
         "gemma3n",

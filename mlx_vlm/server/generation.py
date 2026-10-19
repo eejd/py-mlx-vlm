@@ -44,7 +44,13 @@ from ..sample_utils import (
 from ..speculative.utils import speculative_stats_since, speculative_stats_snapshot
 from ..structured import ThinkingAwareLogitsProcessor
 from ..tokenizer_utils import _ServerTokenStreamer, make_streaming_detokenizer
-from ..utils import ThinkingBudgetCriteria, load, prepare_inputs, resolve_eos_token_ids
+from ..utils import (
+    ThinkingBudgetCriteria,
+    load,
+    prepare_inputs,
+    prompt_starts_with_bos,
+    resolve_eos_token_ids,
+)
 from .runtime import runtime
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -1227,6 +1233,10 @@ class ResponseGenerator:
             in ["gemma3", "gemma3n", "gemma4", "gemma4_unified"]
             else True
         )
+        # The rendered chat prompt may already carry the BOS (Llama 3 templates start
+        # with {{ bos_token }}); never add a second one.
+        if add_special_tokens and prompt_starts_with_bos(prompt, self.processor):
+            add_special_tokens = False
         image_token_index = getattr(self.model.config, "image_token_index", None)
         return prepare_inputs(
             self.processor,
