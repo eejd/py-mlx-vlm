@@ -8,11 +8,15 @@ template asks the model to wrap a value that holds ``<``, ``&`` or a newline in
 name="text">if a < b then <ok> & done</param>``). The call is therefore scanned,
 not run through an XML parser: a value is the text up to the next ``</param>``
 (or the CDATA block when there is one), so markup characters in it do not make
-the call invalid.
+the call invalid. Differences from the ``xml.etree`` parser this replaced: the
+scanner is stricter about text between or after parameters and attributes other
+than ``name`` (a ValueError; ElementTree ignored them), and a numeric character
+reference that is not a valid XML character stays as written. The quantbench
+reference extractor ``minicpm5`` decodes no references at all; the CDATA the chat
+template writes is exact in all three.
 """
 
 import ast
-import html
 import json
 import re
 
@@ -22,9 +26,12 @@ tool_call_end = "</function>"
 _NAME = r"""(?:"([^"]*)"|'([^']*)')"""
 _FUNCTION_OPEN = re.compile(rf"<function\s+name\s*=\s*{_NAME}\s*(/?)>")
 _PARAM_OPEN = re.compile(rf"\s*<param\s+name\s*=\s*{_NAME}\s*(/?)>")
+_PARAM_END = re.compile(r"</param\s*>")
 _FUNCTION_CLOSE = re.compile(r"\s*</function>\s*\Z")
-# The XML character references a model writes instead of CDATA; a bare ``&`` is data.
-_ENTITY = re.compile(r"&(?:amp|lt|gt|quot|apos|#[0-9]+|#[xX][0-9a-fA-F]+);")
+_NAMED_REFERENCES = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+_REFERENCE = re.compile(
+    r"&(?:(amp|lt|gt|quot|apos)|#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6}));"
+)
 
 
 def _argument_properties(name, tools):
@@ -58,18 +65,46 @@ def _name(match):
     return match.group(1) if match.group(1) is not None else match.group(2)
 
 
+def _decode_reference(match):
+    named, decimal, hexadecimal = match.groups()
+    if named:
+        return _NAMED_REFERENCES[named]
+    code = int(decimal) if decimal is not None else int(hexadecimal, 16)
+    valid = (
+        code in (0x9, 0xA, 0xD)
+        or 0x20 <= code <= 0xD7FF
+        or 0xE000 <= code <= 0xFFFD
+        or 0x10000 <= code <= 0x10FFFF
+    )
+    return chr(code) if valid else match.group()
+
+
+def _unescape(text):
+    """Decode the XML character references in plain text; anything else is data.
+
+    The five named references and numeric references (at most 7 decimal or 6 hex
+    digits) to a valid XML character. An invalid or longer reference stays as written
+    where ElementTree rejected the whole call.
+    """
+    return _REFERENCE.sub(_decode_reference, text) if "&" in text else text
+
+
 def _read_value(text, pos):
     """Read one parameter value starting after its opening tag; return it and the end.
 
-    Text is data up to ``</param>``; a ``<![CDATA[...]]>`` section inside it is exact
-    (no decoding) and may hold ``</param>``. Plain text between sections has its
-    well-formed character references decoded.
+    Text is data up to ``</param>`` (``</param >`` too); a ``<![CDATA[...]]>`` section
+    inside it is exact (no decoding) and may hold ``</param>``. Plain text outside
+    CDATA has its character references decoded (``_unescape``). Whitespace is kept
+    as written, as ElementTree did.
     """
     parts = []
+    close = _PARAM_END.search(text, pos)
     while True:
-        close = text.find("</param>", pos)
-        cdata = text.find("<![CDATA[", pos)
-        if cdata >= 0 and (close < 0 or cdata < close):
+        if close is not None and close.start() < pos:  # it lay inside a CDATA section
+            close = _PARAM_END.search(text, pos)
+        limit = close.start() if close is not None else len(text)
+        cdata = text.find("<![CDATA[", pos, limit)
+        if cdata >= 0:
             parts.append(_unescape(text[pos:cdata]))
             end = text.find("]]>", cdata + len("<![CDATA["))
             if end < 0:
@@ -77,14 +112,10 @@ def _read_value(text, pos):
             parts.append(text[cdata + len("<![CDATA[") : end])
             pos = end + len("]]>")
             continue
-        if close < 0:
+        if close is None:
             raise ValueError("Unterminated MiniCPM5 parameter.")
-        parts.append(_unescape(text[pos:close]))
-        return "".join(parts), close + len("</param>")
-
-
-def _unescape(text):
-    return _ENTITY.sub(lambda m: html.unescape(m.group()), text)
+        parts.append(_unescape(text[pos : close.start()]))
+        return "".join(parts), close.end()
 
 
 def parse_tool_call(text: str, tools=None):

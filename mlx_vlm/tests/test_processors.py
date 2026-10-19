@@ -7,6 +7,7 @@ import importlib
 import json
 import pkgutil
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, nullcontext
 from copy import deepcopy
@@ -2446,7 +2447,13 @@ def test_minicpm5_reference_raw_outputs_parse_to_the_declared_types(case):
         ("<ok>", "<ok>"),
         ("x</y>", "x</y>"),
         # well-formed XML character references are still decoded
-        ("a &amp; b &lt;c&gt; &#65;&#x42;", "a & b <c> AB"),
+        ("a &amp; b &lt;c&gt; &#65;&#x42; &quot;&apos;", "a & b <c> AB \"'"),
+        # a reference to a character XML does not allow stays as written (ElementTree
+        # rejected the call); no cp1252 remapping, no U+FFFD substitution
+        ("&#0; &#xD800; &#x110000; &#8;", "&#0; &#xD800; &#x110000; &#8;"),
+        ("&#x80; &#x9F;", "\x80 \x9f"),
+        # a numeric reference of absurd length is data, not an error
+        ("&#" + "1" * 5000 + ";", "&#" + "1" * 5000 + ";"),
         # CDATA is exact: no decoding, no trimming
         ("<![CDATA[ a &amp; <b> ]]>", " a &amp; <b> "),
         ("<![CDATA[</param>]]> & <![CDATA[x]]>", "</param> & x"),
@@ -2467,6 +2474,48 @@ def test_minicpm5_markup_value_does_not_leak_into_the_next_parameter():
     assert _parse("minicpm5", text, MINICPM_ECHO_TOOLS) == _call(
         "echo_args", text="a < b", count=3
     )
+
+
+def test_minicpm5_close_tag_with_inner_space_and_value_whitespace():
+    # `</param >` closes a parameter as it did with ElementTree; whitespace in a
+    # value is kept as written (the quantbench reference trims a leading CDATA's
+    # surroundings and strip("\n")s plain strings: a documented difference)
+    text = (
+        '<function name="echo_args"><param name="text">\n<![CDATA[x]]>\n</param >'
+        '<param name="count"> 3 </param></function>'
+    )
+    assert _parse("minicpm5", text, MINICPM_ECHO_TOOLS) == _call(
+        "echo_args", text="\nx\n", count=3
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '<function name="echo_args"><param name="text">a</param> stray</function>',
+        '<function name="echo_args" id="1"><param name="text">a</param></function>',
+        '<function name="echo_args"><param name="text" x="1">a</param></function>',
+    ],
+)
+def test_minicpm5_scanner_is_stricter_than_elementtree_about_stray_text_and_attributes(
+    text,
+):
+    with pytest.raises(ValueError):
+        _parse("minicpm5", text, MINICPM_ECHO_TOOLS)
+
+
+def test_minicpm5_many_cdata_sections_scan_in_linear_time():
+    section = "<![CDATA[<a>]]>"
+    text = (
+        '<function name="echo_args"><param name="text">'
+        + section * 100_000
+        + "</param></function>"
+    )
+    started = time.perf_counter()
+    assert _parse("minicpm5", text, MINICPM_ECHO_TOOLS) == _call(
+        "echo_args", text="<a>" * 100_000
+    )
+    assert time.perf_counter() - started < 5
 
 
 HARMONY_ANALYSIS_THEN_CALL = (
