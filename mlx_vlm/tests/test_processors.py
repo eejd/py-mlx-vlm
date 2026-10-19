@@ -2373,6 +2373,102 @@ def test_minicpm5_cdata_and_argument_types():
     assert json.loads(result.calls[1]["function"]["arguments"]) == {}
 
 
+# Raw model outputs of MiniCPM5-2B-4bit (openbmb/MiniCPM5-2B-MLX, greedy) from the
+# `tool_arg` cases of eejd/py-quantbench docs/evidence/model-qualification-2026-10-19/
+# minicpm5-2b-4bit/result.json, verbatim.
+MINICPM_ECHO_TOOLS = [
+    dict(
+        type="function",
+        function=dict(
+            name="echo_args",
+            parameters=dict(
+                type="object",
+                properties=dict(
+                    text=dict(type="string"),
+                    count=dict(type="integer"),
+                    flag=dict(type="boolean"),
+                    items=dict(type="array", items=dict(type="string")),
+                    nested=dict(type="object"),
+                ),
+            ),
+        ),
+    )
+]
+MINICPM_ECHO_RAW = {
+    "scalars-00": (
+        '<function name="echo_args"><param name="text">hand summer</param>'
+        '<param name="count">17</param><param name="flag">True</param></function>',
+        dict(text="hand summer", count=17, flag=True),
+    ),
+    "list-01": (
+        '<function name="echo_args"><param name="text">list</param>'
+        "<param name=\"items\">['age', 'computer', 'issue']</param></function>",
+        dict(text="list", items=["age", "computer", "issue"]),
+    ),
+    "object-02": (
+        '<function name="echo_args"><param name="text">obj</param>'
+        "<param name=\"nested\">{'unit': 'a', 'depth': 2}</param></function>",
+        dict(text="obj", nested={"unit": "a", "depth": 2}),
+    ),
+    "markup-03": (
+        '<function name="echo_args"><param name="text">if student < way and '
+        "official > organization then <ok> & done</param></function>",
+        dict(text="if student < way and official > organization then <ok> & done"),
+    ),
+    "code-04": (
+        '<function name="echo_args"><param name="text">'
+        "<![CDATA[def canyon(x):\n    return x + 1]]></param></function>",
+        dict(text="def canyon(x):\n    return x + 1"),
+    ),
+    "markup-08": (
+        '<function name="echo_args"><param name="text">if interest < couple and '
+        "summer > way then <ok> & done</param></function>",
+        dict(text="if interest < couple and summer > way then <ok> & done"),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", MINICPM_ECHO_RAW)
+def test_minicpm5_reference_raw_outputs_parse_to_the_declared_types(case):
+    raw, expected = MINICPM_ECHO_RAW[case]
+    result = process_tool_calls(raw, load_tool_module("minicpm5"), MINICPM_ECHO_TOOLS)
+    assert result.remaining_text == ""
+    assert [call["function"]["name"] for call in result.calls] == ["echo_args"]
+    assert json.loads(result.calls[0]["function"]["arguments"]) == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        # markup characters in a value without CDATA are data, not a syntax error
+        ("a < b", "a < b"),
+        ("a & b", "a & b"),
+        ("<ok>", "<ok>"),
+        ("x</y>", "x</y>"),
+        # well-formed XML character references are still decoded
+        ("a &amp; b &lt;c&gt; &#65;&#x42;", "a & b <c> AB"),
+        # CDATA is exact: no decoding, no trimming
+        ("<![CDATA[ a &amp; <b> ]]>", " a &amp; <b> "),
+        ("<![CDATA[</param>]]> & <![CDATA[x]]>", "</param> & x"),
+    ],
+)
+def test_minicpm5_string_values_with_markup_characters(value, expected):
+    text = f'<function name="echo_args"><param name="text">{value}</param></function>'
+    assert _parse("minicpm5", text, MINICPM_ECHO_TOOLS) == _call(
+        "echo_args", text=expected
+    )
+
+
+def test_minicpm5_markup_value_does_not_leak_into_the_next_parameter():
+    text = (
+        '<function name="echo_args"><param name="text">a < b</param>'
+        '<param name="count">3</param></function>'
+    )
+    assert _parse("minicpm5", text, MINICPM_ECHO_TOOLS) == _call(
+        "echo_args", text="a < b", count=3
+    )
+
+
 HARMONY_ANALYSIS_THEN_CALL = (
     "<|channel|>analysis<|message|>The user wants the weather. Call get_weather."
     "<|end|><|start|>assistant<|channel|>commentary to=functions.get_weather "
