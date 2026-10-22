@@ -82,8 +82,6 @@ class ThinkingStreamState:
         # arrive in later chunks than the marker itself.
         self.strip_leading_newlines = False
         self.buffer = ""
-        self.explicit_parser = get_server_reasoning_parser() is not None
-        self.content_started = False
 
     def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
         self.buffer += text or ""
@@ -120,36 +118,15 @@ class ThinkingStreamState:
                     if not self.buffer:
                         break
                     self.strip_leading_newlines = False
-                if self.explicit_parser and not self.content_started:
-                    # Another thinking block right after the first one is
-                    # reasoning too; hold what could still turn into one.
-                    head = self.buffer.lstrip()
-                    opened = next(
-                        (m for m in self.open_markers if head.startswith(m)), None
-                    )
-                    if opened:
-                        self.buffer = head[len(opened) :].lstrip("\n")
-                        self.in_thinking = True
-                        self.thinking_done = False
-                        reasoning.append("\n")
-                        continue
-                    if not last and any(m.startswith(head) for m in self.open_markers):
-                        break
                 emit, self.buffer = self._split_partial(self.buffer, _CONTENT_MARKERS)
                 emit = _strip_content_markers(emit)
                 if emit:
                     content.append(emit)
-                    self.content_started = True
                 break
 
-            # With an explicit parser a closing marker that no block opened is
-            # consumed as well, so it never reaches the content.
-            markers = self.open_markers + (
-                self.close_markers if self.explicit_parser else ()
-            )
-            idx, marker = self._find_first(self.buffer, markers)
+            idx, marker = self._find_first(self.buffer, self.open_markers)
             if idx < 0:
-                emit, self.buffer = self._split_partial(self.buffer, markers)
+                emit, self.buffer = self._split_partial(self.buffer, self.open_markers)
                 emit = _strip_content_markers(emit)
                 if emit:
                     content.append(emit)
@@ -161,11 +138,7 @@ class ThinkingStreamState:
                     content.append(emit)
 
             self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
-            if marker in self.close_markers:
-                self.thinking_done = True
-                self.strip_leading_newlines = True
-            else:
-                self.in_thinking = True
+            self.in_thinking = True
 
         if last and self.buffer:
             held, self.buffer = self.buffer, ""
@@ -271,6 +244,127 @@ class ResponseTemplateStreamState:
         )
 
 
+class ReasoningParserStreamState:
+    """``--reasoning-parser``: a reply is ``[thinking block]* content``.
+
+    A block is ``<start>reasoning<end>``, or ``reasoning<end>`` when the prompt
+    opened it (``enable_thinking`` here); a block cut off by the token limit is
+    reasoning with no content. Every leading block is reasoning, whatever
+    follows the first text outside a block is content verbatim (a stray marker
+    in it stays), and a closing marker at the very start of a reply, with no
+    block open, is dropped. The whole-reply split is this state fed once, so a
+    streamed and a whole reply cannot disagree, whatever the chunking.
+    """
+
+    def __init__(
+        self,
+        enable_thinking: bool = False,
+        thinking_start_token: Optional[str] = None,
+        thinking_end_token: Optional[str] = None,
+    ):
+        pairs = ThinkingStreamState._build_open_close_markers(
+            thinking_start_token, thinking_end_token
+        )
+        self.open_markers = tuple(marker for marker, _ in pairs)
+        self.close_markers = tuple(marker for _, marker in pairs)
+        # "head": before the first content; "thinking"; "content".
+        self.state = "thinking" if enable_thinking else "head"
+        self.block_start = bool(enable_thinking)
+        self.reasoning_seen = False
+        self.buffer = ""
+
+    def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
+        self.buffer += text or ""
+        reasoning = []
+        content = []
+        thinking_closed = False
+        find_first = ThinkingStreamState._find_first
+        split_partial = ThinkingStreamState._split_partial
+
+        while self.buffer:
+            if self.state == "thinking":
+                if self.block_start:
+                    # Whitespace after the opening marker, and an opening marker
+                    # repeated by a model whose prompt already opened the block.
+                    head = self.buffer.lstrip()
+                    opened = next(
+                        (m for m in self.open_markers if head.startswith(m)), None
+                    )
+                    if opened:
+                        head = head[len(opened) :].lstrip()
+                    elif not last and any(
+                        m.startswith(head) for m in self.open_markers
+                    ):
+                        self.buffer = head
+                        break
+                    self.buffer = head
+                    self.block_start = False
+                    continue
+                idx, marker = find_first(self.buffer, self.close_markers)
+                if idx < 0:
+                    emit, self.buffer = split_partial(self.buffer, self.close_markers)
+                    if emit:
+                        reasoning.append(emit)
+                        self.reasoning_seen = self.reasoning_seen or bool(emit.strip())
+                    break
+                before = self.buffer[:idx]
+                if before:
+                    reasoning.append(before)
+                    self.reasoning_seen = self.reasoning_seen or bool(before.strip())
+                self.buffer = self.buffer[idx + len(marker) :]
+                self.state = "head"
+                thinking_closed = True
+                continue
+
+            if self.state == "head":
+                head = self.buffer.lstrip()
+                if not head:
+                    self.buffer = ""
+                    break
+                opened = next(
+                    (m for m in self.open_markers if head.startswith(m)), None
+                )
+                if opened:
+                    self.buffer = head[len(opened) :]
+                    self.state = "thinking"
+                    self.block_start = True
+                    if self.reasoning_seen:
+                        reasoning.append("\n")
+                    continue
+                closer = next(
+                    (m for m in self.close_markers if head.startswith(m)), None
+                )
+                if closer:
+                    self.buffer = head[len(closer) :]
+                    continue
+                markers = self.open_markers + self.close_markers
+                if not last and any(m.startswith(head) for m in markers):
+                    self.buffer = head
+                    break
+                self.buffer = head
+                self.state = "content"
+                continue
+
+            emit, self.buffer = split_partial(self.buffer, _CONTENT_MARKERS)
+            emit = _strip_content_markers(emit)
+            if emit:
+                content.append(emit)
+            break
+
+        if last and self.buffer:
+            held, self.buffer = self.buffer, ""
+            if self.state == "thinking":
+                reasoning.append(held)
+            else:
+                content.append(_strip_content_markers(held))
+
+        return ThinkingStreamDelta(
+            reasoning="".join(reasoning) or None,
+            content="".join(content) or None,
+            thinking_closed=thinking_closed,
+        )
+
+
 def _response_template_tokenizer(processor):
     if processor is None:
         return None
@@ -294,6 +388,10 @@ def make_response_stream_state(
             logger.debug(
                 "Falling back from tokenizer response-template parser", exc_info=True
             )
+    if get_server_reasoning_parser():
+        return ReasoningParserStreamState(
+            enable_thinking, thinking_start_token, thinking_end_token
+        )
     return ThinkingStreamState(
         enable_thinking,
         thinking_start_token,
@@ -518,7 +616,15 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    prompt_opened_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
+    """Split a whole reply into ``(reasoning, content)``.
+
+    ``prompt_opened_thinking`` (the prompt ended inside a thinking block) is read
+    only with ``--reasoning-parser``, which splits at a closing marker only when
+    the prompt opened the block; without it a closer-only reply is found by the
+    generic scan below, and ``starts_in_thinking`` keeps its own meaning.
+    """
     if not text:
         return None, text
 
@@ -544,15 +650,18 @@ def _split_thinking(
                 "Falling back from tokenizer response-template parser", exc_info=True
             )
 
-    pairs = ThinkingStreamState._build_open_close_markers(
-        thinking_start_token, thinking_end_token
-    )
     if get_server_reasoning_parser():
-        split = _split_leading_blocks(text, pairs)
-        if split is not None:
-            return split
+        # The stream state run over the whole reply: one grammar for both.
+        delta = ReasoningParserStreamState(
+            starts_in_thinking or prompt_opened_thinking,
+            thinking_start_token,
+            thinking_end_token,
+        ).feed(text, last=True)
+        return (delta.reasoning or "").strip() or None, (delta.content or "").strip()
 
-    for start_marker, end_marker in pairs:
+    for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
+        thinking_start_token, thinking_end_token
+    ):
         start = text.find(start_marker)
         end = text.find(end_marker, start if start >= 0 else 0)
         if start >= 0 and start < end:
@@ -578,43 +687,6 @@ def _split_thinking(
     return None, _strip_content_markers(text).strip()
 
 
-def _split_leading_blocks(
-    text: str, pairs: Tuple[Tuple[str, str], ...]
-) -> Optional[Tuple[Optional[str], str]]:
-    """Reasoning/content split of a reply written as ``[thinking]* content``.
-
-    A thinking block is ``<start>reasoning<end>``, or ``reasoning<end>`` when
-    the template opened it in the prompt. Every leading block is reasoning (a
-    model that thinks twice), a block cut off by the token limit is reasoning
-    with no content, and a closing marker is never left in the content.
-    ``None`` when the reply does not begin with a thinking block.
-    """
-    parts = []
-    rest = text
-    consumed = False
-    while True:
-        head = rest.lstrip()
-        for start_marker, end_marker in pairs:
-            if head.startswith(start_marker):
-                body, closed, rest = head[len(start_marker) :].partition(end_marker)
-                break
-            end = head.find(end_marker)
-            start = head.find(start_marker)
-            if end >= 0 and (start < 0 or end < start):
-                body, closed, rest = head.partition(end_marker)
-                break
-        else:
-            break
-        consumed = True
-        parts.append(body.strip())
-        if not closed:
-            break
-    if not consumed:
-        return None
-    reasoning = "\n".join(part for part in parts if part)
-    return reasoning or None, _strip_content_markers(rest).strip()
-
-
 def _response_output_items_from_text(
     full_text: str,
     message_id: str,
@@ -625,12 +697,14 @@ def _response_output_items_from_text(
     thinking_end_token: Optional[str] = None,
     reasoning_item_id: Optional[str] = None,
     processor=None,
+    prompt_opened_thinking: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
         thinking_start_token,
         thinking_end_token,
         processor=processor,
+        prompt_opened_thinking=prompt_opened_thinking,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
@@ -643,6 +717,7 @@ def _response_output_items_from_text(
                 tc.remaining_text or "",
                 thinking_start_token,
                 thinking_end_token,
+                prompt_opened_thinking=prompt_opened_thinking,
             )
             remaining = strip_protocol_markers(
                 remaining, tool_module, thinking_start_token, thinking_end_token

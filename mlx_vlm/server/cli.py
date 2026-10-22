@@ -168,11 +168,12 @@ def main():
         default=get_server_reasoning_parser(),
         help=(
             "Read only this parser's thinking delimiters (qwen3: <think>, "
-            "</think>) when splitting reasoning_content from content: every "
-            "leading thinking block is reasoning, and no thinking marker is "
-            "left in the content. Without it every known delimiter family is "
-            "read. enable_thinking, or chat_template_kwargs, still decides "
-            "whether the template thinks."
+            "</think>) when splitting reasoning_content from content, for "
+            "every model the server hosts: every leading thinking block is "
+            "reasoning, a closing marker leading the reply is dropped, and "
+            "the content after the leading blocks is verbatim. Without it "
+            "every known delimiter family is read. enable_thinking, or "
+            "chat_template_kwargs, still decides whether the template thinks."
         ),
     )
     parser.add_argument(

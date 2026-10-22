@@ -23,19 +23,39 @@ logger = logging.getLogger("mlx_vlm.server")
 
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
 
-# Keys the server sets itself, or that would break the template call.
+# Keys a request cannot pass through chat_template_kwargs: the parameters of the
+# apply_chat_template / get_chat_template / get_message_json calls (a duplicate is
+# a TypeError), what the server sets per request, and the inputs the per-model
+# formatters read from the same keyword arguments.
 _RESERVED_TEMPLATE_KWARGS = frozenset(
     {
+        # parameters of the calls the kwargs are forwarded to
+        "processor",
+        "config",
+        "prompt",
         "messages",
-        "conversation",
+        "model_name",
+        "role",
+        "add_generation_prompt",
+        "return_messages",
+        "num_images",
+        "num_audios",
+        "skip_image_token",
+        "skip_audio_token",
+        "tokenize",
+        # set by the server
         "tools",
         "tool_choice",
-        "tokenize",
-        "add_generation_prompt",
+        # template call options and formatter inputs
+        "chat_template",
+        "conversation",
         "continue_final_message",
         "return_dict",
         "return_tensors",
-        "chat_template",
+        "video",
+        "fps",
+        "max_pixels",
+        "audio_token",
     }
 )
 

@@ -1713,6 +1713,42 @@ def test_endpoint_thinking_markers(client, api, family):
     )
 
 
+def test_reserved_template_kwargs_cover_the_parameters_they_would_duplicate():
+    import inspect
+
+    from mlx_vlm import prompt_utils
+    from mlx_vlm.server import request_normalization
+
+    reserved = request_normalization._RESERVED_TEMPLATE_KWARGS
+    for fn in (
+        prompt_utils.apply_chat_template,
+        prompt_utils.get_chat_template,
+        prompt_utils.get_message_json,
+    ):
+        named = {
+            name
+            for name, param in inspect.signature(fn).parameters.items()
+            if param.kind is not param.VAR_KEYWORD
+        }
+        assert named <= reserved, (fn.__name__, named - reserved)
+
+
+def test_reserved_chat_template_kwargs_never_reach_the_template(client):
+    from mlx_vlm.server import request_normalization
+
+    reserved = {key: "x" for key in request_normalization._RESERVED_TEMPLATE_KWARGS}
+    with _endpoint() as fake:
+        response = _post(
+            client, chat_template_kwargs={**reserved, "custom_flag": "y"}
+        )
+    assert response.status_code == 200, response.text
+    sent = fake.template.call_args.kwargs
+    assert sent["custom_flag"] == "y"
+    # what the call itself carries is the server's, not the request's
+    assert sent.get("tools") is None and sent.get("num_images") == 0
+    assert not {"x"} & {v for k, v in sent.items() if k != "custom_flag"}
+
+
 @pytest.mark.parametrize("api", ["chat", "responses", "messages"])
 def test_endpoints_render_the_template_with_chat_template_kwargs(client, api):
     """The vLLM / mlx-lm / SGLang request field; every API route reads it."""
@@ -2916,14 +2952,29 @@ def test_thinking_stream_markers(family, enabled):
 
 
 _QWEN3_REPLIES = [
-    # reply, template opened the block in the prompt, (reasoning, content)
+    # reply, the prompt opened the block, (reasoning, content)
     ("<think>plan</think>\n\nAnswer.", False, ("plan", "Answer.")),
     ("plan</think>\n\nAnswer.", True, ("plan", "Answer.")),
-    ("</think>Answer.", True, (None, "Answer.")),
+    ("<think>plan</think>Answer.", True, ("plan", "Answer.")),
+    ("  \n<think>p</think>A", False, ("p", "A")),
     ("<think>a</think>\n\n<think>b</think>\n\nAnswer.", False, ("a\nb", "Answer.")),
     ("a</think>\n\n<think>b</think>Answer.", True, ("a\nb", "Answer.")),
     ("<think>cut off", False, ("cut off", "")),
     ("Answer.", False, (None, "Answer.")),
+    # a closing marker leading the reply, no block open, is dropped
+    ("</think>Answer.", True, (None, "Answer.")),
+    ("</think>Answer.", False, (None, "Answer.")),
+    ("<think>x</think></think>Ans", False, ("x", "Ans")),
+    # text outside the leading blocks is content verbatim: markers in it stay
+    ("plan</think>\n\nAnswer.", False, (None, "plan</think>\n\nAnswer.")),
+    (
+        "Answer with `</think>` inside code.",
+        False,
+        (None, "Answer with `</think>` inside code."),
+    ),
+    ("x</think>y</think>z", False, (None, "x</think>y</think>z")),
+    ("<think>x</think>Ans</think>", False, ("x", "Ans</think>")),
+    ("x</think>Ans <think>y</think> z", True, ("x", "Ans <think>y</think> z")),
     # not this parser's delimiters: they are content
     (
         "<|channel>thought\nx<channel|>Answer.",
@@ -2943,30 +2994,31 @@ def test_qwen3_reasoning_parser_splits_the_whole_reply(
     qwen3_parser, reply, preopened, expected
 ):
     assert server._split_thinking(reply, starts_in_thinking=preopened) == expected
+    assert (
+        server._split_thinking(reply, prompt_opened_thinking=preopened) == expected
+    )
 
 
 @pytest.mark.parametrize("reply,preopened,expected", _QWEN3_REPLIES)
-@pytest.mark.parametrize("size", [1, 3, 1000])
+@pytest.mark.parametrize("size", [1, 2, 3, 5, 1000])
 def test_qwen3_reasoning_parser_stream_matches_the_whole_reply(
     qwen3_parser, reply, preopened, expected, size
 ):
     chunks = [reply[i : i + size] for i in range(0, len(reply), size)]
-    state = server.ThinkingStreamState(enable_thinking=preopened)
+    state = server.make_response_stream_state(NS(), preopened)
     reasoning, content = _thoughts(_feed_thinking(state, chunks, last=True))
-    assert (reasoning or None, content.strip()) == expected
-
-
-def test_qwen3_reasoning_parser_drops_a_closing_marker_no_block_opened(qwen3_parser):
-    state = server.ThinkingStreamState()
-    deltas = _feed_thinking(state, ["Answer", "</thi", "nk>", " tail"], last=True)
-    assert _thoughts(deltas) == ("", "Answer tail")
+    assert ((reasoning or "").strip() or None, content.strip()) == expected
+    # the stream stops at what it can emit: nothing it sent is taken back
+    state = server.make_response_stream_state(NS(), preopened)
+    sent = _thoughts(_feed_thinking(state, chunks, last=False))
+    assert reasoning.startswith(sent[0]) and content.startswith(sent[1])
 
 
 def test_reasoning_parser_is_off_unless_selected(monkeypatch):
     monkeypatch.delenv("MLX_VLM_REASONING_PARSER", raising=False)
     # every family is read, a closing marker nothing opened stays content
     assert server._split_thinking("<|channel>thought\nx<channel|>y") == ("x", "y")
-    state = server.ThinkingStreamState()
+    state = server.make_response_stream_state(NS())
     assert _thoughts(_feed_thinking(state, ["a</think>b"], last=True)) == (
         "",
         "a</think>b",
@@ -2994,16 +3046,82 @@ def test_stream_endpoints_split_the_reasoning_with_the_qwen3_parser(
     assert "think>" not in response.text
 
 
+_PREOPENED_REPLY = "plan</think>\n\n<think>more</think>\n\nAnswer."
+
+
 def test_chat_endpoint_splits_the_reasoning_with_the_qwen3_parser(
     client, qwen3_parser
 ):
-    reply = "plan</think>\n\n<think>more</think>\n\nAnswer."
-    with _endpoint(template="prompt<think>\n", result=_result(reply)):
+    with _endpoint(template="prompt<think>\n", result=_result(_PREOPENED_REPLY)):
         message = _post(client, "chat").json()["choices"][0]["message"]
     assert (message["reasoning_content"], message["content"]) == (
         "plan\nmore",
         "Answer.",
     )
+
+
+def test_responses_endpoint_splits_a_preopened_reply_with_the_qwen3_parser(
+    client, qwen3_parser
+):
+    with _endpoint(template="prompt<think>\n", result=_result(_PREOPENED_REPLY)):
+        output = _post(client, "responses").json()["output"]
+    message = next(item for item in output if item["type"] == "message")
+    assert message["content"][0]["text"] == "Answer."
+    assert "think>" not in json.dumps(output)
+
+
+def test_messages_endpoint_splits_a_preopened_reply_with_the_qwen3_parser(
+    client, qwen3_parser
+):
+    with _endpoint(template="prompt<think>\n", result=_result(_PREOPENED_REPLY)):
+        blocks = _post(client, "messages", enable_thinking=True).json()["content"]
+    assert [(b["type"], b.get("thinking") or b.get("text")) for b in blocks] == [
+        ("thinking", "plan\nmore"),
+        ("text", "Answer."),
+    ]
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_a_preopened_reply_with_a_tool_call_keeps_its_reasoning_out_of_the_content(
+    client, qwen3_parser, api
+):
+    reply = 'plan</think>\n\n<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+    with _endpoint(
+        template="prompt<think>\n", result=_result(reply), parser=_JSON_TOOLS
+    ):
+        body = _post(client, api, tools=[_tool(api=api)]).json()
+    if api == "chat":
+        message = body["choices"][0]["message"]
+        assert message["tool_calls"] and not message["content"]
+        assert message["reasoning_content"] == "plan"
+    elif api == "responses":
+        kinds = [item["type"] for item in body["output"]]
+        assert "function_call" in kinds
+        for item in body["output"]:
+            if item["type"] == "message":
+                assert "plan" not in json.dumps(item["content"])
+    else:
+        assert any(block["type"] == "tool_use" for block in body["content"])
+        assert all(
+            "plan" not in block.get("text", "")
+            for block in body["content"]
+            if block["type"] == "text"
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["false", 1, ["enable_thinking"], "{}"],
+    ids=["str", "int", "list", "json-str"],
+)
+@pytest.mark.parametrize("api,status", [("chat", 422), ("messages", 400)])
+def test_non_dict_chat_template_kwargs_are_rejected(client, api, status, value):
+    # (the responses route builds its request model unguarded: any invalid
+    # field raises there, as it did before this field existed)
+    with _endpoint() as fake:
+        response = _post(client, api, chat_template_kwargs=value)
+    assert response.status_code == status, response.text
+    fake.template.assert_not_called()
 
 
 def test_response_template_thinking_stream():
