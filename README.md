@@ -186,6 +186,8 @@ Requests can override the server defaults with `enable_thinking`, `thinking_budg
 
 Requests can also pass `chat_template_kwargs` (the field vLLM, SGLang and mlx-lm take), for example `{"enable_thinking": true}`. Its `enable_thinking` is resolved like the top-level field, which wins when both are set; other keys reach the chat template unchanged.
 
+By default the server splits `reasoning_content` from `content` at every known thinking delimiter family (`<think>`, Gemma 4 channels, Cohere, ...). `--reasoning-parser qwen3` reads only `<think>` / `</think>`: every leading thinking block is reasoning (a second block right after the first as well), a closing marker that no block opened is dropped, and the other families' delimiters stay content. The flag does not switch thinking on; `enable_thinking` or `chat_template_kwargs` does.
+
 ### Speculative Decoding
 
 Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.

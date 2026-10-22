@@ -2690,6 +2690,7 @@ class TestResponseGenerator:
             ("thinking-budget", "THINKING_BUDGET", "128"),
             ("thinking-start-token", "THINKING_START_TOKEN", "<|START_THINKING|>"),
             ("thinking-eos-token", "THINKING_END_TOKEN", "<|END_THINKING|>"),
+            ("reasoning-parser", "REASONING_PARSER", "qwen3"),
             ("api-key", "SERVER_API_KEY", "admin-token"),
         ]
         expected = {"MLX_VLM_" + env: value for _, env, value in flags}
@@ -2912,6 +2913,97 @@ def test_thinking_stream_markers(family, enabled):
     tokens, options, expected = _THINKING_CASES[family]
     state = server.ThinkingStreamState(enable_thinking=enabled, **options)
     assert _thoughts(_feed_thinking(state, [t.text for t in tokens])) == expected
+
+
+_QWEN3_REPLIES = [
+    # reply, template opened the block in the prompt, (reasoning, content)
+    ("<think>plan</think>\n\nAnswer.", False, ("plan", "Answer.")),
+    ("plan</think>\n\nAnswer.", True, ("plan", "Answer.")),
+    ("</think>Answer.", True, (None, "Answer.")),
+    ("<think>a</think>\n\n<think>b</think>\n\nAnswer.", False, ("a\nb", "Answer.")),
+    ("a</think>\n\n<think>b</think>Answer.", True, ("a\nb", "Answer.")),
+    ("<think>cut off", False, ("cut off", "")),
+    ("Answer.", False, (None, "Answer.")),
+    # not this parser's delimiters: they are content
+    (
+        "<|channel>thought\nx<channel|>Answer.",
+        False,
+        (None, "<|channel>thought\nx<channel|>Answer."),
+    ),
+]
+
+
+@pytest.fixture
+def qwen3_parser(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_REASONING_PARSER", "qwen3")
+
+
+@pytest.mark.parametrize("reply,preopened,expected", _QWEN3_REPLIES)
+def test_qwen3_reasoning_parser_splits_the_whole_reply(
+    qwen3_parser, reply, preopened, expected
+):
+    assert server._split_thinking(reply, starts_in_thinking=preopened) == expected
+
+
+@pytest.mark.parametrize("reply,preopened,expected", _QWEN3_REPLIES)
+@pytest.mark.parametrize("size", [1, 3, 1000])
+def test_qwen3_reasoning_parser_stream_matches_the_whole_reply(
+    qwen3_parser, reply, preopened, expected, size
+):
+    chunks = [reply[i : i + size] for i in range(0, len(reply), size)]
+    state = server.ThinkingStreamState(enable_thinking=preopened)
+    reasoning, content = _thoughts(_feed_thinking(state, chunks, last=True))
+    assert (reasoning or None, content.strip()) == expected
+
+
+def test_qwen3_reasoning_parser_drops_a_closing_marker_no_block_opened(qwen3_parser):
+    state = server.ThinkingStreamState()
+    deltas = _feed_thinking(state, ["Answer", "</thi", "nk>", " tail"], last=True)
+    assert _thoughts(deltas) == ("", "Answer tail")
+
+
+def test_reasoning_parser_is_off_unless_selected(monkeypatch):
+    monkeypatch.delenv("MLX_VLM_REASONING_PARSER", raising=False)
+    # every family is read, a closing marker nothing opened stays content
+    assert server._split_thinking("<|channel>thought\nx<channel|>y") == ("x", "y")
+    state = server.ThinkingStreamState()
+    assert _thoughts(_feed_thinking(state, ["a</think>b"], last=True)) == (
+        "",
+        "a</think>b",
+    )
+
+
+def test_unknown_reasoning_parser_is_an_error(monkeypatch):
+    monkeypatch.setenv("MLX_VLM_REASONING_PARSER", "nope")
+    with pytest.raises(ValueError, match="nope"):
+        server._split_thinking("a</think>b")
+
+
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_stream_endpoints_split_the_reasoning_with_the_qwen3_parser(
+    client, qwen3_parser, api
+):
+    tokens = [
+        _token(text)
+        for text in ["plan", "</think>\n\n", "<think>more", "</think>", "Answer."]
+    ]
+    tokens[-1] = _token("Answer.", finish_reason="stop")
+    with _endpoint(template="prompt<think>\n", generator=_streaming(tokens, 8)):
+        response = _post(client, api, stream=True, enable_thinking=True)
+    assert _thinking_text(response, api) == ("plan\nmore", "Answer.")
+    assert "think>" not in response.text
+
+
+def test_chat_endpoint_splits_the_reasoning_with_the_qwen3_parser(
+    client, qwen3_parser
+):
+    reply = "plan</think>\n\n<think>more</think>\n\nAnswer."
+    with _endpoint(template="prompt<think>\n", result=_result(reply)):
+        message = _post(client, "chat").json()["choices"][0]["message"]
+    assert (message["reasoning_content"], message["content"]) == (
+        "plan\nmore",
+        "Answer.",
+    )
 
 
 def test_response_template_thinking_stream():

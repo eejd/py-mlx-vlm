@@ -18,6 +18,22 @@ logger = logging.getLogger("mlx_vlm.server")
 RESPONSE_STORE_LIMIT = int(os.environ.get("MLX_VLM_RESPONSE_STORE_LIMIT", "1024"))
 _CONTENT_MARKERS = ("<|START_TEXT|>", "<|END_TEXT|>")
 
+# Names follow vLLM / SGLang / vllm-mlx.
+REASONING_PARSERS = {"qwen3": ("<think>", "</think>")}
+
+
+def get_server_reasoning_parser() -> Optional[str]:
+    """The server's ``--reasoning-parser`` (``MLX_VLM_REASONING_PARSER``)."""
+    name = os.environ.get("MLX_VLM_REASONING_PARSER")
+    if not name:
+        return None
+    if name not in REASONING_PARSERS:
+        raise ValueError(
+            f"Unknown reasoning parser {name!r}; choose from "
+            f"{sorted(REASONING_PARSERS)}"
+        )
+    return name
+
 
 def _strip_content_markers(text: str) -> str:
     for marker in _CONTENT_MARKERS:
@@ -66,6 +82,8 @@ class ThinkingStreamState:
         # arrive in later chunks than the marker itself.
         self.strip_leading_newlines = False
         self.buffer = ""
+        self.explicit_parser = get_server_reasoning_parser() is not None
+        self.content_started = False
 
     def feed(self, text: str, last: bool = False) -> ThinkingStreamDelta:
         self.buffer += text or ""
@@ -102,15 +120,36 @@ class ThinkingStreamState:
                     if not self.buffer:
                         break
                     self.strip_leading_newlines = False
+                if self.explicit_parser and not self.content_started:
+                    # Another thinking block right after the first one is
+                    # reasoning too; hold what could still turn into one.
+                    head = self.buffer.lstrip()
+                    opened = next(
+                        (m for m in self.open_markers if head.startswith(m)), None
+                    )
+                    if opened:
+                        self.buffer = head[len(opened) :].lstrip("\n")
+                        self.in_thinking = True
+                        self.thinking_done = False
+                        reasoning.append("\n")
+                        continue
+                    if not last and any(m.startswith(head) for m in self.open_markers):
+                        break
                 emit, self.buffer = self._split_partial(self.buffer, _CONTENT_MARKERS)
                 emit = _strip_content_markers(emit)
                 if emit:
                     content.append(emit)
+                    self.content_started = True
                 break
 
-            idx, marker = self._find_first(self.buffer, self.open_markers)
+            # With an explicit parser a closing marker that no block opened is
+            # consumed as well, so it never reaches the content.
+            markers = self.open_markers + (
+                self.close_markers if self.explicit_parser else ()
+            )
+            idx, marker = self._find_first(self.buffer, markers)
             if idx < 0:
-                emit, self.buffer = self._split_partial(self.buffer, self.open_markers)
+                emit, self.buffer = self._split_partial(self.buffer, markers)
                 emit = _strip_content_markers(emit)
                 if emit:
                     content.append(emit)
@@ -122,7 +161,11 @@ class ThinkingStreamState:
                     content.append(emit)
 
             self.buffer = self.buffer[idx + len(marker) :].lstrip("\n")
-            self.in_thinking = True
+            if marker in self.close_markers:
+                self.thinking_done = True
+                self.strip_leading_newlines = True
+            else:
+                self.in_thinking = True
 
         if last and self.buffer:
             held, self.buffer = self.buffer, ""
@@ -146,7 +189,13 @@ class ThinkingStreamState:
         markers = []
         if thinking_start_token and thinking_end_token:
             markers.append((thinking_start_token, thinking_end_token))
-        for marker_pair in cls._DEFAULT_OPEN_CLOSE_MARKERS:
+        parser = get_server_reasoning_parser()
+        # An explicit parser reads its own delimiters only; without one every
+        # known family is tried.
+        defaults = (
+            (REASONING_PARSERS[parser],) if parser else cls._DEFAULT_OPEN_CLOSE_MARKERS
+        )
+        for marker_pair in defaults:
             if marker_pair not in markers:
                 markers.append(marker_pair)
         return tuple(markers)
@@ -495,9 +544,15 @@ def _split_thinking(
                 "Falling back from tokenizer response-template parser", exc_info=True
             )
 
-    for start_marker, end_marker in ThinkingStreamState._build_open_close_markers(
+    pairs = ThinkingStreamState._build_open_close_markers(
         thinking_start_token, thinking_end_token
-    ):
+    )
+    if get_server_reasoning_parser():
+        split = _split_leading_blocks(text, pairs)
+        if split is not None:
+            return split
+
+    for start_marker, end_marker in pairs:
         start = text.find(start_marker)
         end = text.find(end_marker, start if start >= 0 else 0)
         if start >= 0 and start < end:
@@ -521,6 +576,43 @@ def _split_thinking(
         return reasoning or None, ""
 
     return None, _strip_content_markers(text).strip()
+
+
+def _split_leading_blocks(
+    text: str, pairs: Tuple[Tuple[str, str], ...]
+) -> Optional[Tuple[Optional[str], str]]:
+    """Reasoning/content split of a reply written as ``[thinking]* content``.
+
+    A thinking block is ``<start>reasoning<end>``, or ``reasoning<end>`` when
+    the template opened it in the prompt. Every leading block is reasoning (a
+    model that thinks twice), a block cut off by the token limit is reasoning
+    with no content, and a closing marker is never left in the content.
+    ``None`` when the reply does not begin with a thinking block.
+    """
+    parts = []
+    rest = text
+    consumed = False
+    while True:
+        head = rest.lstrip()
+        for start_marker, end_marker in pairs:
+            if head.startswith(start_marker):
+                body, closed, rest = head[len(start_marker) :].partition(end_marker)
+                break
+            end = head.find(end_marker)
+            start = head.find(start_marker)
+            if end >= 0 and (start < 0 or end < start):
+                body, closed, rest = head.partition(end_marker)
+                break
+        else:
+            break
+        consumed = True
+        parts.append(body.strip())
+        if not closed:
+            break
+    if not consumed:
+        return None
+    reasoning = "\n".join(part for part in parts if part)
+    return reasoning or None, _strip_content_markers(rest).strip()
 
 
 def _response_output_items_from_text(
