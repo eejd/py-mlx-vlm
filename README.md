@@ -184,6 +184,8 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 
 Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`.
 
+Requests can also pass `chat_template_kwargs` (the field vLLM, SGLang and mlx-lm take), for example `{"enable_thinking": true}`. Its `enable_thinking` is resolved like the top-level field, which wins when both are set; other keys reach the chat template unchanged.
+
 ### Speculative Decoding
 
 Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.

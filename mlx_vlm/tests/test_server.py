@@ -1713,6 +1713,18 @@ def test_endpoint_thinking_markers(client, api, family):
     )
 
 
+@pytest.mark.parametrize("api", ["chat", "responses", "messages"])
+def test_endpoints_render_the_template_with_chat_template_kwargs(client, api):
+    """The vLLM / mlx-lm / SGLang request field; every API route reads it."""
+    payload = dict(chat_template_kwargs={"enable_thinking": True, "custom_flag": "x"})
+    with _endpoint() as fake:
+        response = _post(client, api, **payload)
+    assert response.status_code == 200, response.text
+    _assert_fields(
+        fake.template.call_args.kwargs, enable_thinking=True, custom_flag="x"
+    )
+
+
 @pytest.mark.parametrize("api", ["chat", "responses"])
 def test_stream_endpoints_do_not_clear_mlx_cache_on_close(client, api):
     with _endpoint(generator=_streaming([_token("ok", finish_reason="stop")])):
@@ -2591,6 +2603,82 @@ class TestResponseGenerator:
             legacy = NS(**req.model_dump())
             legacy.repetition_context_size = None
             _assert_fields(vars(server._build_gen_args(legacy)), **expected)
+
+    @pytest.mark.parametrize(
+        "options,env,expected",
+        [
+            (
+                dict(chat_template_kwargs={"enable_thinking": True}),
+                "0",
+                dict(enable_thinking=True, reasoning=True),
+            ),
+            (
+                dict(chat_template_kwargs={"enable_thinking": False}),
+                "1",
+                dict(enable_thinking=False, reasoning=False),
+            ),
+            (
+                dict(enable_thinking=False, chat_template_kwargs={"enable_thinking": 1}),
+                "0",
+                dict(enable_thinking=False, reasoning=False),
+            ),
+            (
+                dict(
+                    reasoning_effort="low",
+                    chat_template_kwargs={"enable_thinking": False},
+                ),
+                "0",
+                dict(enable_thinking=False, reasoning=False, reasoning_effort="low"),
+            ),
+            (
+                dict(chat_template_kwargs={"enable_thinking": None}),
+                "1",
+                dict(enable_thinking=True),
+            ),
+            (dict(chat_template_kwargs={"other": 1}), "0", dict(enable_thinking=False)),
+        ],
+        ids=["kwargs-on", "kwargs-off", "top-level-wins", "over-effort", "null", "other"],
+    )
+    def test_chat_template_kwargs_thinking_precedence(
+        self, monkeypatch, options, env, expected
+    ):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", env)
+        args = server._build_gen_args(_chat_request(**options))
+        _assert_fields(vars(args), **expected)
+        _assert_fields(args.to_template_kwargs(), enable_thinking=args.enable_thinking)
+
+    def test_chat_template_kwargs_reach_the_template_but_not_reserved_keys(
+        self, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("MLX_VLM_ENABLE_THINKING", "0")
+        req = _chat_request(
+            chat_template_kwargs={
+                "thinking": True,
+                "enable_thinking": True,
+                "tools": [],
+                "tokenize": True,
+                "add_generation_prompt": False,
+            },
+            thinking_budget=7,
+        )
+        with caplog.at_level(logging.WARNING, logger="mlx_vlm.server"):
+            kw = server._build_gen_args(req).to_template_kwargs()
+        _assert_fields(kw, thinking=True, enable_thinking=True, thinking_budget=7)
+        assert not {"tools", "tokenize", "add_generation_prompt"} & kw.keys()
+        assert "tokenize" in caplog.text
+        # a key the server computes beats the same key in the kwargs
+        req = _chat_request(
+            reasoning_effort="high", chat_template_kwargs={"reasoning_effort": "low"}
+        )
+        _assert_fields(
+            server._build_gen_args(req).to_template_kwargs(), reasoning_effort="high"
+        )
+        assert (
+            server._build_gen_args(
+                _chat_request(chat_template_kwargs={"reasoning_effort": "low"})
+            ).to_template_kwargs()["reasoning_effort"]
+            == "low"
+        )
 
     def test_server_cli_sets_thinking_defaults(self, monkeypatch):
         flags = [

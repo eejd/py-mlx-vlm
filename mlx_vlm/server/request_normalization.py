@@ -1,5 +1,6 @@
 """Normalize compatible API requests into server generation arguments."""
 
+import logging
 from typing import Optional, Tuple, Union
 
 from ..generate import (
@@ -18,7 +19,38 @@ from .generation import (
 )
 from .runtime import runtime
 
+logger = logging.getLogger("mlx_vlm.server")
+
 _DISABLED_REASONING_EFFORTS = {"none", "off", "disabled", "false", "0"}
+
+# Keys the server sets itself, or that would break the template call.
+_RESERVED_TEMPLATE_KWARGS = frozenset(
+    {
+        "messages",
+        "conversation",
+        "tools",
+        "tool_choice",
+        "tokenize",
+        "add_generation_prompt",
+        "continue_final_message",
+        "return_dict",
+        "return_tensors",
+        "chat_template",
+    }
+)
+
+
+def _chat_template_kwargs(request) -> dict:
+    """The request's ``chat_template_kwargs`` without the reserved keys."""
+    raw = getattr(request, "chat_template_kwargs", None)
+    if not isinstance(raw, dict):
+        return {}
+    reserved = _RESERVED_TEMPLATE_KWARGS.intersection(raw)
+    if reserved:
+        logger.warning(
+            "Ignoring reserved chat_template_kwargs keys: %s", sorted(reserved)
+        )
+    return {key: value for key, value in raw.items() if key not in reserved}
 
 
 def _request_field_is_set(request, field_name: str) -> bool:
@@ -153,9 +185,13 @@ def _build_gen_args(
     standard_reasoning, reasoning_effort, has_standard_reasoning = (
         _standard_reasoning_control(request)
     )
+    template_kwargs = _chat_template_kwargs(request)
     server_enable_thinking = get_server_enable_thinking()
     if _request_field_is_set(request, "enable_thinking"):
         enable_thinking = bool(getattr(request, "enable_thinking", False))
+        template_reasoning = enable_thinking
+    elif template_kwargs.get("enable_thinking") is not None:
+        enable_thinking = bool(template_kwargs["enable_thinking"])
         template_reasoning = enable_thinking
     elif has_standard_reasoning:
         enable_thinking = bool(standard_reasoning)
@@ -246,6 +282,7 @@ def _build_gen_args(
             config=config,
         ),
         tenant_id=tenant_id,
+        chat_template_kwargs=template_kwargs or None,
     )
     if processor is not None:
         args.logits_processors = structured_logits_processor_builder(request, processor)

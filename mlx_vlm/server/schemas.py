@@ -1,5 +1,5 @@
 import os
-from typing import TYPE_CHECKING, Any, List, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Required, TypeAlias, TypedDict
@@ -23,6 +23,11 @@ def get_server_max_tokens():
 
 _TOOL_PARSER_DESC = (
     "Force a specific tool-call parser by name, bypassing chat-template inference."
+)
+_CHAT_TEMPLATE_KWARGS_DESC = (
+    "Extra keyword arguments for the chat template (the vLLM / mlx-lm field). "
+    "`enable_thinking` is honoured like the top-level field, which wins when "
+    "both are set."
 )
 
 
@@ -395,6 +400,9 @@ class OpenAIRequest(FlexibleBaseModel):
     reasoning_effort: Optional[str] = Field(
         None,
         description="OpenAI-compatible reasoning effort.",
+    )
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        None, description=_CHAT_TEMPLATE_KWARGS_DESC
     )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
@@ -798,6 +806,9 @@ class VLMRequest(FlexibleBaseModel):
         None,
         description="OpenAI-compatible reasoning effort.",
     )
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        None, description=_CHAT_TEMPLATE_KWARGS_DESC
+    )
     thinking_budget: Optional[int] = Field(None, description="Max thinking tokens.")
     thinking_start_token: Optional[str] = Field(
         None, description="Thinking start token."
@@ -979,6 +990,9 @@ class AnthropicRequest(FlexibleBaseModel):
     )
     logit_bias: Optional[Any] = Field(None, description="Logit bias dict.")
     enable_thinking: Optional[bool] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = Field(
+        None, description=_CHAT_TEMPLATE_KWARGS_DESC
+    )
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
