@@ -1005,11 +1005,18 @@ async def anthropic_messages_endpoint(http_request: Request):
                 metrics.record_result(result)
                 finish_reason = getattr(result, "finish_reason", None) or "stop"
 
+            prompt_opened = prompt_has_open_thinking(
+                formatted_prompt,
+                gen_args.enable_thinking,
+                gen_args.thinking_start_token,
+                gen_args.thinking_end_token,
+            )
             reasoning, content = _split_thinking(
                 full_text,
                 gen_args.thinking_start_token,
                 gen_args.thinking_end_token,
                 processor=processor,
+                prompt_opened_thinking=prompt_opened,
             )
             parsed_tool_calls = None
             if tool_module is not None and tools:
@@ -1021,6 +1028,7 @@ async def anthropic_messages_endpoint(http_request: Request):
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,
+                        prompt_opened_thinking=prompt_opened,
                     )
                     content = strip_protocol_markers(
                         content,

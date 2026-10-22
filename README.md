@@ -184,6 +184,10 @@ mlx_vlm.server --model Qwen/Qwen3.5-4B \
 
 Requests can override the server defaults with `enable_thinking`, `thinking_budget`, `thinking_start_token`, or `thinking_end_token`.
 
+Requests can also pass `chat_template_kwargs` (the field vLLM, SGLang and mlx-lm take), for example `{"enable_thinking": true}`. Its `enable_thinking` is resolved like the top-level field, which wins when both are set; other keys reach the chat template unchanged.
+
+By default the server splits `reasoning_content` from `content` at every known thinking delimiter family (`<think>`, Gemma 4 channels, Cohere, ...). `--reasoning-parser qwen3` reads only `<think>` / `</think>`, for streamed and whole replies alike (one state machine): every leading thinking block is reasoning (a second block right after the first as well; a block closed by `</think>` alone only when the prompt opened it), a closing marker leading the reply with no block open is dropped, and from the first text outside the leading blocks on the content is verbatim (a literal `</think>` in it stays). The other families' delimiters stay content, for every model the server hosts: the flag is server-wide. It does not switch thinking on; `enable_thinking` or `chat_template_kwargs` does (a template-specific switch passed only through `chat_template_kwargs` does not change what the server expects to be open).
+
 ### Speculative Decoding
 
 Speed up generation by drafting several candidate tokens with a small "drafter" model and verifying them in a single target forward pass. Three drafter families are supported.

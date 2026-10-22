@@ -1174,6 +1174,12 @@ async def responses_endpoint(request: Request):
                             gen_args.thinking_end_token,
                             reasoning_item_id,
                             processor=processor,
+                            prompt_opened_thinking=prompt_has_open_thinking(
+                                formatted_prompt,
+                                gen_args.enable_thinking,
+                                gen_args.thinking_start_token,
+                                gen_args.thinking_end_token,
+                            ),
                         )
                     )
                     tool_output_items = [
@@ -1433,6 +1439,12 @@ async def responses_endpoint(request: Request):
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
                         processor=processor,
+                        prompt_opened_thinking=prompt_has_open_thinking(
+                            formatted_prompt,
+                            gen_args.enable_thinking,
+                            gen_args.thinking_start_token,
+                            gen_args.thinking_end_token,
+                        ),
                     )
                 )
                 if output_finish_reason == "tool_calls":
@@ -2225,16 +2237,17 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 mx.clear_cache()
                 gc.collect()
 
+                prompt_opened = prompt_has_open_thinking(
+                    formatted_prompt,
+                    gen_args.enable_thinking,
+                    gen_args.thinking_start_token,
+                    gen_args.thinking_end_token,
+                )
                 reasoning, content = _split_thinking(
                     full_text,
                     gen_args.thinking_start_token,
                     gen_args.thinking_end_token,
-                    prompt_has_open_thinking(
-                        formatted_prompt,
-                        gen_args.enable_thinking,
-                        gen_args.thinking_start_token,
-                        gen_args.thinking_end_token,
-                    ),
+                    prompt_opened,
                     processor=processor,
                 )
 
@@ -2264,6 +2277,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             tc.remaining_text or "",
                             gen_args.thinking_start_token,
                             gen_args.thinking_end_token,
+                            prompt_opened_thinking=prompt_opened,
                         )
                         content = (
                             strip_protocol_markers(

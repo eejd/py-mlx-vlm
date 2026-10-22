@@ -19,6 +19,7 @@ from .generation import (
     get_server_thinking_start_token,
 )
 from .model_discovery import MODEL_PATHS_ENV
+from .responses_state import REASONING_PARSERS, get_server_reasoning_parser
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
@@ -159,6 +160,20 @@ def main():
         help=(
             "Default token that closes a thinking block. Requests can override "
             "this with thinking_end_token."
+        ),
+    )
+    parser.add_argument(
+        "--reasoning-parser",
+        choices=sorted(REASONING_PARSERS),
+        default=get_server_reasoning_parser(),
+        help=(
+            "Read only this parser's thinking delimiters (qwen3: <think>, "
+            "</think>) when splitting reasoning_content from content, for "
+            "every model the server hosts: every leading thinking block is "
+            "reasoning, a closing marker leading the reply is dropped, and "
+            "the content after the leading blocks is verbatim. Without it "
+            "every known delimiter family is read. enable_thinking, or "
+            "chat_template_kwargs, still decides whether the template thinks."
         ),
     )
     parser.add_argument(
@@ -332,6 +347,8 @@ def main():
         os.environ["MLX_VLM_THINKING_START_TOKEN"] = args.thinking_start_token
     if args.thinking_end_token is not None:
         os.environ["MLX_VLM_THINKING_END_TOKEN"] = args.thinking_end_token
+    if args.reasoning_parser is not None:
+        os.environ["MLX_VLM_REASONING_PARSER"] = args.reasoning_parser
     if args.kv_bits is not None:
         os.environ["KV_BITS"] = str(args.kv_bits)
     if args.kv_key_bits is not None:

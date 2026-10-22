@@ -639,6 +639,9 @@ class GenerationArguments:
     thinking_budget: Optional[int] = None
     thinking_start_token: Optional[str] = None
     thinking_end_token: Optional[str] = None
+    # Extra chat-template keyword arguments from the request's
+    # chat_template_kwargs, reserved keys already removed.
+    chat_template_kwargs: Optional[dict] = None
     skip_special_tokens: bool = True
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None
     # Per-tenant salt for APC. When set, it's mixed into ``extra_hash`` so
@@ -716,7 +719,11 @@ class GenerationArguments:
 
     def to_template_kwargs(self) -> dict:
         """Convert to kwargs for apply_chat_template()."""
-        kw = {"enable_thinking": self.enable_thinking}
+        # Request chat_template_kwargs first: what the server resolved below
+        # (enable_thinking included, already taken from the kwargs when the
+        # request carries no top-level value) wins over a same-named key.
+        kw = dict(self.chat_template_kwargs or {})
+        kw["enable_thinking"] = self.enable_thinking
         if self.reasoning is not None:
             kw["reasoning"] = self.reasoning
         if self.reasoning_effort is not None:
