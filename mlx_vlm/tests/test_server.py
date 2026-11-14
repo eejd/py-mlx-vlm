@@ -11017,3 +11017,43 @@ def test_diffusion_http_checkpoint_replays_without_regeneration(
         assert resumed.status_code == 200
         assert text(original)[: checkpoint["content"]] + text(resumed) == text(original)
         worker.generate.assert_not_called()
+
+
+def test_reasoning_parser_does_not_run_a_tool_call_in_a_second_thinking_block(
+    monkeypatch,
+):
+    """Tool calls are looked for in the content the --reasoning-parser grammar
+    yields, not in what the delimiter state calls content: every leading block
+    is reasoning there, so a call written inside the second one never runs."""
+    import importlib
+
+    from mlx_vlm.server import responses_state
+
+    monkeypatch.setenv("MLX_VLM_REASONING_PARSER", "qwen3")
+    tool_module = importlib.import_module("mlx_vlm.tools.parsers.json_tools")
+    tools = [
+        {
+            "type": "function",
+            "function": {"name": "f", "parameters": {"type": "object"}},
+        }
+    ]
+    call = '<tool_call>\n{"name": "f", "arguments": {}}\n</tool_call>'
+
+    def parse(text, starts_in_thinking=False):
+        return responses_state.parse_assistant_tool_calls(
+            text,
+            tool_module,
+            tools,
+            starts_in_thinking=starts_in_thinking,
+            thinking_start_token="<think>",
+            thinking_end_token="</think>",
+        )
+
+    inside_second_block = parse(f"<think>a</think>\n<think>b {call}</think>\nhello")
+    assert inside_second_block.calls == []
+    assert inside_second_block.remaining_text.strip() == "hello"
+    # A call after the blocks is still a call, with or without the opened prompt.
+    after_blocks = parse(f"<think>a</think>\n<think>b</think>\n{call}")
+    assert [c["function"]["name"] for c in after_blocks.calls] == ["f"]
+    after_opened = parse(f"plan</think>\n{call}", starts_in_thinking=True)
+    assert [c["function"]["name"] for c in after_opened.calls] == ["f"]

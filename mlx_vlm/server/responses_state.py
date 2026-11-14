@@ -720,10 +720,17 @@ def parse_assistant_tool_calls(
     Response-template parsers may consume tool regions, so split reasoning with
     the delimiter state instead. Examples inside reasoning are never tool calls.
     """
+    # With --reasoning-parser the reply is split by that grammar everywhere
+    # (``_split_thinking``, the streams), so the text tool calls are looked for
+    # in is the content it yields; the delimiter state would treat a second
+    # leading thinking block as content and run a call written inside it.
+    state_cls = (
+        ReasoningParserStreamState
+        if get_server_reasoning_parser()
+        else ThinkingStreamState
+    )
     content = (
-        ThinkingStreamState(
-            starts_in_thinking, thinking_start_token, thinking_end_token
-        )
+        state_cls(starts_in_thinking, thinking_start_token, thinking_end_token)
         .feed(text, last=True)
         .content
     )
