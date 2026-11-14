@@ -9,6 +9,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import HTTPException
+from transformers.utils.chat_parsing.response_templates import load_response_template
 
 from ..prompt_utils import _normalize_tool_message
 from ..tools import process_tool_calls
@@ -374,16 +375,30 @@ def _response_template_tokenizer(processor):
     return tokenizer
 
 
+def _response_template_prefix(tokenizer, prompt: str) -> str:
+    if not prompt:
+        return ""
+    template = load_response_template(tokenizer.response_template)
+    # Without an assistant anchor, the parser includes the entire prompt as output.
+    return prompt if template.start_anchor_re.search(prompt) else ""
+
+
 def make_response_stream_state(
     processor,
     enable_thinking: bool = False,
     thinking_start_token: Optional[str] = None,
     thinking_end_token: Optional[str] = None,
+    *,
+    prompt: str = "",
 ):
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "get_response_parser"):
         try:
-            return ResponseTemplateStreamState(tokenizer.get_response_parser(prefix=""))
+            return ResponseTemplateStreamState(
+                tokenizer.get_response_parser(
+                    prefix=_response_template_prefix(tokenizer, prompt)
+                )
+            )
         except (AttributeError, TypeError, ValueError):
             logger.debug(
                 "Falling back from tokenizer response-template parser", exc_info=True
@@ -616,6 +631,8 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    *,
+    prompt: str = "",
     prompt_opened_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
     """Split a whole reply into ``(reasoning, content)``.
@@ -631,7 +648,9 @@ def _split_thinking(
     tokenizer = _response_template_tokenizer(processor)
     if tokenizer is not None and hasattr(tokenizer, "parse_response"):
         try:
-            parsed = tokenizer.parse_response(text, prefix="")
+            parsed = tokenizer.parse_response(
+                text, prefix=_response_template_prefix(tokenizer, prompt)
+            )
             if isinstance(parsed, dict) and (
                 "content" in parsed
                 or "reasoning" in parsed
@@ -687,6 +706,30 @@ def _split_thinking(
     return None, _strip_content_markers(text).strip()
 
 
+def parse_assistant_tool_calls(
+    text,
+    tool_module,
+    tools,
+    *,
+    starts_in_thinking=False,
+    thinking_start_token=None,
+    thinking_end_token=None,
+):
+    """Parse executable calls from the same content seen by the streaming parser.
+
+    Response-template parsers may consume tool regions, so split reasoning with
+    the delimiter state instead. Examples inside reasoning are never tool calls.
+    """
+    content = (
+        ThinkingStreamState(
+            starts_in_thinking, thinking_start_token, thinking_end_token
+        )
+        .feed(text, last=True)
+        .content
+    )
+    return process_tool_calls(content or "", tool_module, tools)
+
+
 def _response_output_items_from_text(
     full_text: str,
     message_id: str,
@@ -697,32 +740,46 @@ def _response_output_items_from_text(
     thinking_end_token: Optional[str] = None,
     reasoning_item_id: Optional[str] = None,
     processor=None,
+    starts_in_thinking: bool = False,
+    tool_delta_state=None,
+    *,
+    prompt: str = "",
     prompt_opened_thinking: bool = False,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], str]:
     reasoning, content = _split_thinking(
         full_text,
         thinking_start_token,
         thinking_end_token,
+        starts_in_thinking=starts_in_thinking,
         processor=processor,
+        prompt=prompt,
         prompt_opened_thinking=prompt_opened_thinking,
     )
     reasoning_items = _reasoning_output_items(reasoning, reasoning_item_id)
     if tool_module is not None and chat_tools:
-        tc = process_tool_calls(full_text, tool_module, chat_tools)
+        tc = parse_assistant_tool_calls(
+            full_text,
+            tool_module,
+            chat_tools,
+            starts_in_thinking=starts_in_thinking,
+            thinking_start_token=thinking_start_token,
+            thinking_end_token=thinking_end_token,
+        )
+        if tool_delta_state is not None:
+            tool_delta_state.finish(tc.calls)
         if tc.calls:
             items = [
                 _tool_call_to_response_item(call, tool_registry) for call in tc.calls
             ]
-            _, remaining = _split_thinking(
+            remaining = strip_protocol_markers(
                 tc.remaining_text or "",
+                tool_module,
                 thinking_start_token,
                 thinking_end_token,
-                prompt_opened_thinking=prompt_opened_thinking,
-            )
-            remaining = strip_protocol_markers(
-                remaining, tool_module, thinking_start_token, thinking_end_token
             )
             return reasoning_items + items, remaining, reasoning, "tool_calls"
+    if not content:
+        return reasoning_items, content, reasoning, "stop"
     item = {
         "id": message_id,
         "type": "message",
@@ -898,7 +955,13 @@ def _append_response_item_to_prompt(
                     part["text"] for part in content_parts if part.get("type") == "text"
                 )
                 message["content"] = text
-                chat_messages.append(_normalize_tool_message(message))
+                if (
+                    role != "assistant"
+                    or text
+                    or reasoning
+                    or message.get("tool_calls")
+                ):
+                    chat_messages.append(_normalize_tool_message(message))
                 chat_messages.append(_response_image_message(len(item_images)))
                 return
             if item_images:
@@ -908,16 +971,22 @@ def _append_response_item_to_prompt(
                     part["text"] for part in content_parts if part.get("type") == "text"
                 )
         message["content"] = content or ""
+        if role == "assistant" and not (
+            content or reasoning or message.get("tool_calls")
+        ):
+            return
         chat_messages.append(_normalize_tool_message(message))
         return
 
     if item_type in ("function_call", "shell_call", "apply_patch_call"):
         chat_messages.append(
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [_response_call_to_chat_tool_call(item)],
-            }
+            _normalize_tool_message(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_response_call_to_chat_tool_call(item)],
+                }
+            )
         )
         return
 
@@ -959,7 +1028,16 @@ def _response_chain_items(previous_response_id: Optional[str]) -> List[Dict[str,
                     detail=f"Previous response not found: {current_id}",
                 )
             chain.append(stored)
-            current_id = stored.previous_response_id
+            # A self-contained compaction boundary no longer needs its older
+            # response chain, which may already have been evicted from the store.
+            current_id = (
+                None
+                if any(
+                    item.get("type") == "compaction"
+                    for item in stored.input_items + stored.output_items
+                )
+                else stored.previous_response_id
+            )
 
     items: List[Dict[str, Any]] = []
     for stored in reversed(chain):

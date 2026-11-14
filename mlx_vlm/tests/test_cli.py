@@ -4,6 +4,7 @@ import argparse
 import importlib
 import inspect
 import io
+import json
 import os
 import subprocess
 import sys
@@ -101,6 +102,40 @@ def test_cli_boolean_and_thinking_flags(entrypoint, default):
     with pytest.raises(SystemExit) as error:
         parser.parse_args(["--thinking-mode", "invalid"])
     assert error.value.code == 2
+
+
+def test_cli_reasoning_effort_parsing():
+    parser = _capture_parser(dispatch.parse_arguments)
+    assert parser.parse_args([]).reasoning_effort is None
+    for effort in ("low", "medium", "high"):
+        parsed = parser.parse_args(["--reasoning-effort", effort])
+        assert parsed.reasoning_effort == effort
+    # Matches the server's case-insensitive handling of reasoning_effort.
+    assert parser.parse_args(["--reasoning-effort", "Medium"]).reasoning_effort == (
+        "medium"
+    )
+
+
+@pytest.mark.parametrize("effort", [None, "medium"])
+def test_text_cli_forwards_reasoning_effort_to_template(effort):
+    args = _args(
+        image=["image.png"],
+        prompt=["Describe this input."],
+        reasoning_effort=effort,
+    )
+    with _text_cli(args) as mocks:
+        dispatch.main()
+    template_kwargs = mocks.apply_chat_template.call_args.kwargs
+    if effort is None:
+        # The template default must stay untouched when the flag is omitted.
+        assert "reasoning_effort" not in template_kwargs
+        assert "reasoning_strength" not in template_kwargs
+    else:
+        # Same mapping as the server: the raw key plus the
+        # reasoning_strength alias read by Muse Glimmer's template.
+        _assert_fields(
+            template_kwargs, reasoning_effort=effort, reasoning_strength=effort
+        )
 
 
 def test_cli_and_library_agree_on_shared_defaults():
@@ -346,7 +381,7 @@ def test_text_cli_media_and_arguments(capsys, mode):
         assert output.strip() == "done"
 
 
-@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("modality", ["image", "video", "3d"])
 def test_modality_routing_precedes_vlm_load(modality):
     args = NS(output_modality=modality)
     with (
@@ -364,7 +399,10 @@ def test_image_cli_request_and_output(tmp_path, task):
     edit = task == "edit"
     output = tmp_path / "image.png"
     extras = (
-        {}
+        {
+            "gen_kwargs": {"upsample_prompt": False},
+            "prompt_expansion_model": "local-pup",
+        }
         if edit
         else dict(
             gen_kwargs={"sampler_preset": "V4_TURBO_12"},
@@ -399,6 +437,10 @@ def test_image_cli_request_and_output(tmp_path, task):
         assert request.prompt == "add sunglasses"
         assert request.image_paths == ("reference.png",)
         assert (request.width, request.height) == (256, 512)
+        assert request.extra == {
+            "upsample_prompt": False,
+            "prompt_expansion_model": "local-pup",
+        }
     else:
         assert request.extra == dict(
             sampler_preset="V4_TURBO_12", prompt_expansion_model="tiny-text-model"
@@ -497,3 +539,156 @@ def test_video_generation_cli(tmp_path, capsys, mode, image, last, workflow):
         assert generate.call_args.kwargs["output_path"] == output
         stdout = capsys.readouterr().out
         assert "workflow=ref2va" in stdout and "generation_fps=" in stdout
+
+
+@pytest.mark.parametrize("state_file", [False, True])
+@pytest.mark.parametrize("questions_file", [False, True])
+def test_decision_cli_routes_inputs_and_returns_json(
+    tmp_path, capsys, monkeypatch, state_file, questions_file
+):
+    from mlx_vlm import decide
+
+    state = "Please refund my café purchase."
+    questions = {"route": {"type": "choice", "criteria": ["billing", "support"]}}
+    result = {"answers": {"route": {"type": "choice", "value": "billing"}}}
+    args = ["--model", "model/path"]
+    for name, value, use_file in (
+        ("state", state, state_file),
+        ("questions", json.dumps(questions), questions_file),
+    ):
+        if use_file:
+            path = tmp_path / name
+            path.write_text(value, encoding="utf-8")
+            args.extend([f"--{name}-file", str(path)])
+        else:
+            args.extend([f"--{name}", value])
+    model, processor = object(), object()
+    load = Mock(return_value=(model, processor))
+    predict = Mock(return_value=result)
+    monkeypatch.setattr(decide, "load", load)
+    monkeypatch.setattr(decide, "predict", predict)
+    decide.main(args)
+    load.assert_called_once_with("model/path")
+    predict.assert_called_once_with(model, processor, state, questions)
+    assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.parametrize("source", ["inline", "invalid_file", "missing_file"])
+def test_decision_cli_rejects_invalid_questions_before_loading(
+    tmp_path, monkeypatch, source
+):
+    from mlx_vlm import decide
+
+    args = ["--model", "model/path", "--state", "text"]
+    if source == "inline":
+        args.extend(["--questions", "{invalid"])
+    else:
+        path = tmp_path / "questions.json"
+        if source == "invalid_file":
+            path.write_text("{invalid")
+        args.extend(["--questions-file", str(path)])
+    load = Mock()
+    monkeypatch.setattr(decide, "load", load)
+    with pytest.raises(SystemExit) as error:
+        decide.main(args)
+    assert error.value.code == 2
+    load.assert_not_called()
+
+
+def test_decision_cli_reports_unsupported_question(capsys, monkeypatch):
+    from mlx_vlm import decide
+
+    monkeypatch.setattr(
+        decide, "load", lambda path: (NS(decision_types=("choice",)), None)
+    )
+    with pytest.raises(SystemExit) as error:
+        decide.main(
+            [
+                "--model",
+                "model/path",
+                "--state",
+                "text",
+                "--questions",
+                '{"q":{"type":"score","criteria":["low","high"]}}',
+            ]
+        )
+    assert error.value.code == 2
+    assert "does not support 'score'" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("state", [None, "Is this a cat?"])
+@pytest.mark.parametrize(
+    "media, flags",
+    [
+        (
+            {"images": ["cat.jpg", "https://example.com/dog.png"]},
+            ["--image", "cat.jpg", "--image", "https://example.com/dog.png"],
+        ),
+        ({"audio": "meow.flac"}, ["--audio", "meow.flac"]),
+        (
+            {"images": ["cat.jpg"], "audio": "meow.flac"},
+            ["--image", "cat.jpg", "--audio", "meow.flac"],
+        ),
+    ],
+)
+def test_decision_cli_passes_media(monkeypatch, state, media, flags):
+    from mlx_vlm import decide
+
+    questions = {"cat": {"type": "bool"}}
+    args = ["--model", "d1", "--questions", json.dumps(questions), *flags]
+    if state is not None:
+        args += ["--state", state]
+    model, processor = object(), object()
+    predict = Mock(return_value={"answers": {}})
+    monkeypatch.setattr(decide, "load", Mock(return_value=(model, processor)))
+    monkeypatch.setattr(decide, "predict", predict)
+    decide.main(args)
+    predict.assert_called_once_with(model, processor, state, questions, **media)
+
+
+def test_decision_cli_requires_state_or_media(monkeypatch, capsys):
+    from mlx_vlm import decide
+
+    load = Mock()
+    monkeypatch.setattr(decide, "load", load)
+    with pytest.raises(SystemExit) as error:
+        decide.main(["--model", "d1", "--questions", '{"q":{"type":"bool"}}'])
+    assert error.value.code == 2
+    message = "--state --state-file --image --audio is required"
+    assert message in capsys.readouterr().err
+    load.assert_not_called()
+
+
+def test_decide_registered_as_package_subcommand():
+    result = subprocess.run(
+        [sys.executable, "-m", "mlx_vlm", "decide", "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--questions-file" in result.stdout
+    assert "--state-file" in result.stdout
+
+
+@pytest.mark.parametrize("questions", [[], {}, None, "question", {"q": []}])
+@pytest.mark.parametrize("from_file", [False, True])
+def test_decision_cli_rejects_question_structure_before_loading(
+    tmp_path, monkeypatch, capsys, questions, from_file
+):
+    from mlx_vlm import decide
+
+    args = ["--model", "model/path", "--state", "text"]
+    content = json.dumps(questions)
+    if from_file:
+        path = tmp_path / "questions.json"
+        path.write_text(content, encoding="utf-8")
+        args += ["--questions-file", str(path)]
+    else:
+        args += ["--questions", content]
+    load = Mock()
+    monkeypatch.setattr(decide, "load", load)
+    with pytest.raises(SystemExit) as error:
+        decide.main(args)
+    assert error.value.code == 2
+    assert "question" in capsys.readouterr().err.lower()
+    load.assert_not_called()

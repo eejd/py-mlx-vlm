@@ -22,6 +22,7 @@ from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
 from ..generate.image import is_image_generation_model, load_image_generation_model
 from ..generate.image_defaults import ImageSamplingDefaults, resolve_image_defaults
+from ..generate.three_d import load_3d_model
 from ..reranker import RerankerKind, reranker_kind
 from ..structured import build_json_schema_logits_processor
 from ..tools import _infer_tool_parser_from_processor
@@ -30,6 +31,9 @@ from ..vision_cache import VisionFeatureCache
 from . import request_normalization as _request_normalization
 from .anthropic import register_routes as register_anthropic_routes
 from .audio import register_routes as register_audio_routes
+from .continuation import ACTIVE as ACTIVE_CONTINUATION
+from .continuation import ContinuationMiddleware, checkpoint_cleanup
+from .decisions import register_routes as register_decision_routes
 from .embeddings import register_routes as register_embeddings_routes
 from .generation import (
     GenerationArguments,
@@ -46,7 +50,8 @@ from .generation import (
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
-from .model_discovery import MODEL_PATHS_ENV, discover_models
+from .meshes import register_routes as register_mesh_routes
+from .model_discovery import MODEL_PATHS_ENV, discover_models, model_reasoning_efforts
 from .openai import register_routes as register_openai_routes
 from .realtime import register_routes as register_realtime_routes
 from .reranking import ensure_chat_template as ensure_reranker_chat_template
@@ -86,30 +91,23 @@ def _require_management_api_key(request: HTTPConnection) -> None:
 
 def _cache_group_for_cache(cache: dict) -> str:
     model_kind = cache.get("model_kind")
-    if model_kind == "image_generation":
-        return "image_generation"
-    if model_kind == "image_edit":
-        return "image_edit"
     if model_kind == "audio_tts":
         return "tts"
     if model_kind == "audio_stt":
         return "stt"
-    if model_kind == "audio":
-        return "audio"
-    if model_kind == "embedding":
-        return "embedding"
-    if model_kind == "reranker":
-        return "reranker"
-    return "text_generation"
+    return model_kind or "text_generation"
 
 
-def _model_info(model_id: str, created: int, *, loaded: bool = False) -> dict:
+def _model_info(
+    model_id: str, created: int, *, loaded: bool = False, reasoning_efforts=None
+) -> dict:
     model_id = str(model_id)
     return {
         "id": model_id,
         "object": "model",
         "created": created,
         "loaded": loaded,
+        "reasoning_efforts": reasoning_efforts,
     }
 
 
@@ -120,7 +118,14 @@ def _served_model_entries() -> list[dict]:
         model_id = cache.get("model_path")
         if not model_id:
             continue
-        models[model_id] = _model_info(model_id, created, loaded=True)
+        models[model_id] = _model_info(
+            model_id,
+            created,
+            loaded=True,
+            reasoning_efforts=model_reasoning_efforts(
+                Path(model_id).expanduser(), cache.get("processor")
+            ),
+        )
     return list(models.values())
 
 
@@ -230,6 +235,15 @@ async def _preflight_stream_context_budget(
     args: GenerationArguments,
 ):
     """Reject over-budget streaming requests before the HTTP stream starts."""
+    continuation = ACTIVE_CONTINUATION.get()
+    if continuation is not None and continuation.resuming:
+        # The original prompt already passed the context budget check. The GPU
+        # scheduler checks concurrency and memory again when restoring its row.
+        try:
+            continuation.record.session.check()
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        return
     if runtime.response_generator is None:
         return
     try:
@@ -297,6 +311,8 @@ def _split_thinking(
     thinking_end_token: Optional[str] = None,
     starts_in_thinking: bool = False,
     processor=None,
+    *,
+    prompt: str = "",
     prompt_opened_thinking: bool = False,
 ) -> Tuple[Optional[str], str]:
     """Split thinking tags from content. Returns (reasoning, content)."""
@@ -306,6 +322,7 @@ def _split_thinking(
         thinking_end_token,
         starts_in_thinking,
         processor=processor,
+        prompt=prompt,
         prompt_opened_thinking=prompt_opened_thinking,
     )
 
@@ -425,6 +442,12 @@ async def lifespan(app):
 
     preload_models = (
         (
+            os.environ.pop("MLX_VLM_PRELOAD_MESH_MODEL", None),
+            None,
+            "mesh_generation",
+            "3D generation model",
+        ),
+        (
             os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
             None,
             "image_generation",
@@ -454,6 +477,12 @@ async def lifespan(app):
             "reranker",
             "reranker model",
         ),
+        (
+            os.environ.pop("MLX_VLM_PRELOAD_DECISION_MODEL", None),
+            None,
+            "decision",
+            "decision model",
+        ),
     )
     runtime.preload_failures.clear()
     for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
@@ -481,15 +510,18 @@ async def lifespan(app):
             )
             continue
         logger.info("%s ready.", label.capitalize())
-    try:
-        yield
-    finally:
-        if runtime.audio_queue is not None:
-            runtime.audio_queue.stop_and_join()
-            runtime.audio_queue = None
-        if runtime.realtime_engine is not None:
-            runtime.realtime_engine.stop_and_join()
-            runtime.realtime_engine = None
+    async with checkpoint_cleanup():
+        try:
+            yield
+        finally:
+            if runtime.mesh_jobs is not None:
+                await asyncio.to_thread(runtime.mesh_jobs.shutdown)
+            if runtime.audio_queue is not None:
+                runtime.audio_queue.stop_and_join()
+                runtime.audio_queue = None
+            if runtime.realtime_engine is not None:
+                runtime.realtime_engine.stop_and_join()
+                runtime.realtime_engine = None
 
 
 app = FastAPI(
@@ -508,6 +540,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-MLX-Continuation"],
+)
+app.add_middleware(
+    ContinuationMiddleware,
+    authenticate=_require_management_api_key,
+    read_tenant=_read_tenant_id,
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
@@ -555,13 +593,24 @@ def _unload_model_cache_group(cache_group: str) -> bool:
         cache["vision_cache"].clear()
 
     registry.pop(cache_group)
+    from .compaction import chat_cache
+
+    chat_cache.clear()
+    cache.clear()
+    del response_generator, apc_manager
     gc.collect()
     mx.clear_cache()
     return True
 
 
 def _audio_model_kind(model_kind: str) -> bool:
-    return model_kind in ("audio", "audio_tts", "audio_stt")
+    return model_kind in (
+        "audio",
+        "audio_tts",
+        "audio_stt",
+        "audio_diarization",
+        "audio_speaker_embedding",
+    )
 
 
 def _audio_cache_group(model_kind: str) -> str:
@@ -569,6 +618,8 @@ def _audio_cache_group(model_kind: str) -> str:
         return "tts"
     if model_kind == "audio_stt":
         return "stt"
+    if model_kind in ("audio_diarization", "audio_speaker_embedding"):
+        return model_kind
     return "audio"
 
 
@@ -577,6 +628,7 @@ def get_cached_model(
     adapter_path=_INHERIT_ADAPTER,
     *,
     model_kind: str = "auto",
+    revision: str | None = None,
 ):
     """
     Factory function to get or load the appropriate model resources from cache or by loading.
@@ -586,6 +638,8 @@ def get_cached_model(
     load_as_audio = _audio_model_kind(model_kind)
     load_as_embedding = model_kind == "embedding"
     load_as_reranker = model_kind == "reranker"
+    load_as_decision = model_kind == "decision"
+    load_as_mesh = model_kind == "mesh_generation"
     load_as_image = model_kind == "image_generation" or (
         model_kind == "auto" and is_image_generation_model(model_path)
     )
@@ -601,6 +655,12 @@ def get_cached_model(
     elif load_as_reranker:
         cache_group = "reranker"
         effective_model_kind = "reranker"
+    elif load_as_decision:
+        cache_group = "decision"
+        effective_model_kind = "decision"
+    elif load_as_mesh:
+        cache_group = "mesh_generation"
+        effective_model_kind = "mesh_generation"
     elif load_as_image:
         cache_group = "image_generation"
         effective_model_kind = "image_generation"
@@ -620,6 +680,8 @@ def get_cached_model(
         effective_model_kind,
         runtime.config.fingerprint(kinds={effective_model_kind}),
     )
+    if revision is not None:
+        cache_key += (revision,)
     cached_cache = registry.for_kind(cache_group)
 
     # Return from cache if already loaded and matches the requested paths
@@ -638,6 +700,25 @@ def get_cached_model(
     if cached_cache:
         logger.info("New %s model requested; clearing its existing cache.", cache_group)
         _unload_model_cache_group(cache_group)
+
+    if load_as_mesh:
+        if adapter_path is not None:
+            raise HTTPException(400, "Adapters are not supported for 3D generation")
+        model = load_3d_model(model_path, revision=revision)
+        config = SimpleNamespace(model_type="idol", text_config=None)
+        registry.set(
+            cache_group,
+            {
+                "cache_key": cache_key,
+                "model_path": model_path,
+                "adapter_path": None,
+                "model": model,
+                "processor": None,
+                "config": config,
+                "model_kind": "mesh_generation",
+            },
+        )
+        return model, None, config
 
     if load_as_edit:
         if adapter_path is not None:
@@ -715,9 +796,14 @@ def get_cached_model(
             )
         logger.info("Loading audio model: %s", model_path)
         try:
-            model = _server_package_attr("load_audio_model", load_audio_model)(
-                model_path
-            )
+            if model_kind in ("audio_diarization", "audio_speaker_embedding"):
+                from .audio_speakers import load_speaker_model
+
+                model = load_speaker_model(model_path, model_kind, revision)
+            else:
+                model = _server_package_attr("load_audio_model", load_audio_model)(
+                    model_path
+                )
         except RepositoryNotFoundError as e:
             raise HTTPException(
                 status_code=404,
@@ -750,6 +836,42 @@ def get_cached_model(
         }
         registry.set(cache_group, cache)
         return model, None, config
+
+    if load_as_decision:
+        from ..utils import load
+
+        if adapter_path is not None:
+            raise HTTPException(
+                status_code=400, detail="Decision adapters are not supported"
+            )
+        try:
+            model, processor = load(model_path)
+            if not getattr(model, "decision_types", ()):
+                raise ValueError("This model does not support decision prediction")
+        except RepositoryNotFoundError as error:
+            raise HTTPException(
+                status_code=404, detail=f"Model not found: {model_path}"
+            ) from error
+        except (FileNotFoundError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        except Exception as error:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load decision model: {error}"
+            ) from error
+        config = model.config
+        registry.set(
+            cache_group,
+            {
+                "cache_key": cache_key,
+                "model_path": model_path,
+                "adapter_path": None,
+                "model": model,
+                "processor": processor,
+                "config": config,
+                "model_kind": "decision",
+            },
+        )
+        return model, processor, config
 
     if load_as_embedding:
         if adapter_path is not None:
@@ -908,8 +1030,8 @@ def get_cached_model(
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
         apc_manager=runtime.apc_manager,
-        draft_model_path=cfg.spec_draft_model,
-        draft_kind=cfg.spec_draft_kind,
+        draft_model_path=cfg.draft_model,
+        draft_kind=cfg.draft_kind,
     )
     try:
         model, processor, config = response_generator.wait_until_ready()
@@ -947,6 +1069,8 @@ def get_cached_model(
 # Synchronous unload function for internal use
 def unload_model_sync():
     unloaded_any = False
+    if runtime.mesh_jobs is not None:
+        runtime.mesh_jobs.shutdown()
     if runtime.audio_queue is not None:
         is_audio_worker = getattr(
             runtime.audio_queue, "is_worker_thread", lambda: False
@@ -967,7 +1091,7 @@ def unload_model_sync():
             unloaded_any = True
 
     registry = _model_cache_registry()
-    for cache_group, _ in list(registry.items()):
+    for cache_group in [key for key, _ in registry.items()]:
         unloaded_any = _unload_model_cache_group(cache_group) or unloaded_any
 
     runtime.response_generator = None
@@ -1010,6 +1134,8 @@ register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
 register_realtime_routes(inference_router, _protocol_deps)
+register_decision_routes(inference_router, _protocol_deps)
+register_mesh_routes(inference_router, _protocol_deps)
 register_embeddings_routes(inference_router, _protocol_deps)
 register_reranking_routes(inference_router, _protocol_deps)
 
@@ -1056,7 +1182,11 @@ def models_endpoint(
     paths.extend(p for p in model_dir or [] if p)
     for model in discover_models(hf_cache_info, paths):
         if model["id"] not in models and model["path"] not in loaded_paths:
-            models[model["id"]] = _model_info(model["id"], model["created"])
+            models[model["id"]] = _model_info(
+                model["id"],
+                model["created"],
+                reasoning_efforts=model_reasoning_efforts(model["path"]),
+            )
 
     return {
         "object": "list",

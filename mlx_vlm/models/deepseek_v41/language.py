@@ -319,7 +319,7 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
     weights = remapped
     prefix = f"{ffn_prefix}.experts"
     for dst in ("gate_proj", "down_proj", "up_proj"):
-        for suffix in ("weight", "scales", "biases"):
+        for suffix in ("weight", "scales", "biases", "weight_scale_2"):
             stacked_key = f"{prefix}.{dst}.{suffix}"
             if stacked_key in weights:
                 weights[f"{ffn_prefix}.switch_mlp.{dst}.{suffix}"] = weights.pop(
@@ -330,7 +330,7 @@ def sanitize_moe_weights(weights: dict, ffn_prefix: str, n_routed: int) -> dict:
         ("w2", "down_proj"),
         ("w3", "up_proj"),
     ):
-        for suffix in ("weight", "scales", "biases"):
+        for suffix in ("weight", "scales", "biases", "weight_scale_2"):
             key0 = f"{prefix}.0.{src}.{suffix}"
             if key0 not in weights:
                 continue
@@ -385,6 +385,7 @@ class DeepseekV41MoEGate(nn.Module):
         inds = mx.argpartition(-(scores + bias), kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ].astype(mx.int32)
+        inds = mx.stop_gradient(inds)
         weights = mx.take_along_axis(scores, inds, axis=-1)
         if self.norm_topk_prob and self.top_k > 1:
             weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
