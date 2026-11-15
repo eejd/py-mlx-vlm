@@ -11059,39 +11059,52 @@ def test_reasoning_parser_does_not_run_a_tool_call_in_a_second_thinking_block(
     assert [c["function"]["name"] for c in after_opened.calls] == ["f"]
 
 
-def test_reasoning_parser_streams_no_tool_call_from_a_second_thinking_block(
-    monkeypatch,
-):
-    """The streamed tool deltas must agree with the final parse: a call written
-    inside a second leading thinking block under --reasoning-parser is never
-    streamed, however the text is chunked, and a call after the blocks is."""
+
+_SECOND_BLOCK_CALL = (
+    "<think>a</think>\n<think>b "
+    '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+    "</think>\nhello"
+)
+_AFTER_BLOCKS_CALL = (
+    "<think>a</think>\n<think>b</think>\n"
+    '<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>'
+)
+
+
+def _streamed_calls(client, api, text, size):
     import importlib
 
-    from mlx_vlm.server import responses_state
-    from mlx_vlm.tools.streaming import ToolCallDeltaState
-
-    monkeypatch.setenv("MLX_VLM_REASONING_PARSER", "qwen3")
-    tool_module = importlib.import_module("mlx_vlm.tools.parsers.json_tools")
-    tools = [
-        {
-            "type": "function",
-            "function": {"name": "f", "parameters": {"type": "object"}},
-        }
+    parts = [text[i : i + size] for i in range(0, len(text), size)]
+    tokens = [
+        _token(part, i, "stop" if i == len(parts) - 1 else None)
+        for i, part in enumerate(parts)
     ]
-    call = '<tool_call>\n{"name": "f", "arguments": {}}\n</tool_call>'
+    response = _stream_response(
+        client,
+        tokens,
+        api,
+        endpoint=dict(
+            parser=importlib.import_module("mlx_vlm.tools.parsers.json_tools")
+        ),
+        tools=[_tool(api=api)],
+    )
+    assert response.status_code == 200
+    events = _data(response)
+    calls = [
+        e for e in events if e.get("choices") and e["choices"][0]["delta"].get("tool_calls")
+    ]
+    calls += [e for e in events if (e.get("item") or {}).get("type") == "function_call"]
+    return calls
 
-    def streamed(text, size):
-        thinking = responses_state.make_tool_thinking_state(
-            False, "<think>", "</think>"
-        )
-        deltas = ToolCallDeltaState(tool_module, tools)
-        out = []
-        chunks = [text[i : i + size] for i in range(0, len(text), size)]
-        for n, chunk in enumerate(chunks):
-            out += deltas.feed(thinking.feed(chunk, last=n == len(chunks) - 1).content)
-        return out
 
-    for size in (1, 3, 7, 1000):
-        assert streamed(f"<think>a</think>\n<think>b {call}</think>\nhello", size) == []
-        assert streamed(f"<think>a</think>\n<think>b</think>\n{call}", size), size
-
+@pytest.mark.parametrize("api", ["chat", "responses"])
+@pytest.mark.parametrize("size", [1, 5, 1000])
+def test_reasoning_parser_streams_no_call_from_a_second_thinking_block(
+    client, monkeypatch, api, size
+):
+    """Streamed tool events agree with the final parse: under --reasoning-parser
+    a call written inside a second leading thinking block is reasoning, however
+    the text is chunked; a call after the blocks is still streamed."""
+    monkeypatch.setenv("MLX_VLM_REASONING_PARSER", "qwen3")
+    assert _streamed_calls(client, api, _SECOND_BLOCK_CALL, size) == []
+    assert _streamed_calls(client, api, _AFTER_BLOCKS_CALL, size)
