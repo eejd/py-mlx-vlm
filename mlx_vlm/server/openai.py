@@ -48,13 +48,13 @@ from .request_normalization import (
     _normalize_instruction_messages,
 )
 from .responses_state import (
-    ThinkingStreamState,
     ToolCallStreamState,
     _normalize_response_input,
     _response_chain_items,
     _response_items_to_chat,
     _response_output_items_from_text,
     _response_tool_registry,
+    make_tool_thinking_state,
 )
 from .responses_state import _sse_event as _response_sse_event
 from .responses_state import (
@@ -1319,7 +1319,7 @@ async def responses_endpoint(request: Request):
                     output_indices = {}
                     pending_whitespace = {}
                     tool_delta_state = ToolCallDeltaState(tool_module, chat_tools)
-                    tool_thinking_state = ThinkingStreamState(
+                    tool_thinking_state = make_tool_thinking_state(
                         starts_in_thinking,
                         gen_args.thinking_start_token,
                         gen_args.thinking_end_token,
@@ -2210,7 +2210,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     tool_delta_state = ToolCallDeltaState(tool_module, tools)
                     # Response templates consume structured tool regions. Split
                     # reasoning separately so the tool parser still sees their markup.
-                    tool_thinking_state = ThinkingStreamState(
+                    tool_thinking_state = make_tool_thinking_state(
                         prompt_has_open_thinking(
                             formatted_prompt,
                             gen_args.enable_thinking,

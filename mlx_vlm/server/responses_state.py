@@ -383,6 +383,27 @@ def _response_template_prefix(tokenizer, prompt: str) -> str:
     return prompt if template.start_anchor_re.search(prompt) else ""
 
 
+def make_tool_thinking_state(
+    starts_in_thinking: bool = False,
+    thinking_start_token: Optional[str] = None,
+    thinking_end_token: Optional[str] = None,
+):
+    """The reasoning splitter whose ``.content`` tool calls are looked for in.
+
+    With ``--reasoning-parser`` the reply is split by that grammar everywhere
+    (``_split_thinking``, the streams), so tool calls must be found in the
+    content it yields: the delimiter state treats a second leading thinking
+    block as content and would run a call written inside it. Streaming tool
+    deltas and the final parse share this one choice so they cannot disagree.
+    """
+    state_cls = (
+        ReasoningParserStreamState
+        if get_server_reasoning_parser()
+        else ThinkingStreamState
+    )
+    return state_cls(starts_in_thinking, thinking_start_token, thinking_end_token)
+
+
 def make_response_stream_state(
     processor,
     enable_thinking: bool = False,
@@ -724,13 +745,10 @@ def parse_assistant_tool_calls(
     # (``_split_thinking``, the streams), so the text tool calls are looked for
     # in is the content it yields; the delimiter state would treat a second
     # leading thinking block as content and run a call written inside it.
-    state_cls = (
-        ReasoningParserStreamState
-        if get_server_reasoning_parser()
-        else ThinkingStreamState
-    )
     content = (
-        state_cls(starts_in_thinking, thinking_start_token, thinking_end_token)
+        make_tool_thinking_state(
+            starts_in_thinking, thinking_start_token, thinking_end_token
+        )
         .feed(text, last=True)
         .content
     )
