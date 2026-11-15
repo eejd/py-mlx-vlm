@@ -15,5 +15,15 @@ old fork `main`, closed fork PR #1). Upstream's `load_model` sanitizes unconditi
 loader refactor, so it is superseded (checked against v0.7.8); the commit survives under
 `archive/main-pre-sync-b39e1df`.
 
-`local` is based on v0.7.4 (the version the port shipped); newer upstream releases up to v0.7.8
-add dependencies (`datasets>=4`, `cryptography`) and `mlx>=0.32.3`, so the base was not moved.
+`local` was based on v0.7.4 (the version the port shipped). Releases up to v0.7.12 need `mlx>=0.32.4`, `datasets>=4`, `cryptography`, `llguidance`, `mlx-audio>=0.6.2`, `miniaudio` and `opencv-python`; the first two now hold on the local MLX 0.32.4 line, which is why the base is moved.
+
+## Merge of upstream v0.7.12 (2026-11-14)
+
+`local` now contains upstream `v0.7.12` (2026-11-04) by a merge commit (branch `merge/upstream-v0.7.12`; history kept, no force-push, no tag cut). The upstream server was split into the `mlx_vlm/server/` package and its reasoning handling reworked (`starts_in_thinking`, `prompt=`, reasoning removed before tool parsing); ten files conflicted:
+
+- Imports: unions (`prompt_starts_with_bos`, `NaiveStreamingDetokenizer` kept with upstream's `processed_image_key`, `trainer.peft.utils`, runtime imports).
+- `app.py`, `responses_state.py`, `openai.py`, `anthropic.py`: upstream's signatures and call sites, with our `prompt_opened_thinking` keyword kept next to upstream's `prompt` for the `--reasoning-parser` grammar; the re-split of `remaining_text` after tool parsing is dropped because upstream removes reasoning before parsing; with `--reasoning-parser`, `parse_assistant_tool_calls` and the streamed tool deltas in `openai.py` (chat and Responses) strip reasoning with our grammar (`ReasoningParserStreamState`, one choice in `make_tool_thinking_state`) instead of upstream's delimiter state, so a call written inside a second leading thinking block is not run and not streamed (found in review; `test_reasoning_parser_does_not_run_a_tool_call_in_a_second_thinking_block`, `test_reasoning_parser_streams_no_call_from_a_second_thinking_block`, chat and Responses, chunk sizes 1/5/1000; it fails on the pre-fix code). Limits: nested thinking markers (`<think>x <think>y</think> <tool_call>..</tool_call></think>`) close the block at the first end marker, in this grammar and upstream's, so a call after an inner end marker still runs; the Anthropic stream's stop-marker check (`tool_output_before_stop`) still uses the delimiter state.
+- `schemas.py` (auto-merged, then fixed): upstream's alias that copies `chat_template_kwargs.enable_thinking` into `enable_thinking` also copied a null, which marked the field as set and turned it into False; a null is now "not given" again (`test_chat_template_kwargs_thinking_precedence[null]`).
+- Tests: both sides kept.
+
+Status of the carried topics against v0.7.12: tekken serving, the BOS fix and the `--reasoning-parser` grammar are still ours; upstream now honours `chat_template_kwargs.enable_thinking` only, while the topic also passes the other keys to the template; the MiniCPM5 parser upstream (`mlx_vlm/tools/parsers/minicpm5.py`) still parses with `xml.etree.ElementTree`, so the tolerant-value topic is still needed.

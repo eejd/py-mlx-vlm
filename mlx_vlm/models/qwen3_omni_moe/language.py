@@ -6,6 +6,7 @@ import numpy as np
 
 from ..base import (
     LanguageModelOutput,
+    cache_position_offset,
     create_attention_mask,
     scaled_dot_product_attention,
 )
@@ -13,7 +14,7 @@ from ..cache import KVCache
 from ..mlp import SwiGLUMLP as MLP
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
-from ..switch_layers import SwitchGLU
+from ..switch_layers import EXPERT_WEIGHT_SUFFIXES, SwitchGLU
 from .config import TextConfig, ThinkerConfig
 
 
@@ -164,6 +165,7 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
@@ -493,7 +495,11 @@ class LanguageModel(nn.Module):
                 position_ids = mx.broadcast_to(
                     position_ids[None, :, :], (3, *position_ids.shape)
                 )
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+                mrope_position_deltas = (
+                    max_position_ids
+                    + 1
+                    - mx.sum(attention_mask, axis=-1, keepdims=True)
+                )
             else:
                 position_ids = mx.arange(input_ids.shape[1]).reshape(1, -1)
                 position_ids = mx.broadcast_to(
@@ -529,12 +535,11 @@ class LanguageModel(nn.Module):
         if rope_deltas_kw is not None:
             self._rope_deltas = rope_deltas_kw
 
-        # Batched cache._idx counts physical columns, including left padding.
         cache_offset = 0
         cache_offsets = None
         if cache and cache[0] is not None:
             c0 = cache[0]
-            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            cache_offset = cache_position_offset(c0)
             if (
                 isinstance(c0.offset, mx.array)
                 and c0.offset.ndim > 0
@@ -681,16 +686,17 @@ class LanguageModel(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"thinker.language_model.model.layers.{l}.mlp"
             for n in ["gate_proj", "down_proj", "up_proj"]:
-                experts_weights = []
-                for e in range(self.args.num_experts):
-                    key = f"{prefix}.experts.{e}.{n}.weight"
-                    if key in weights:
-                        experts_weights.append(weights.pop(key))
+                for suffix in EXPERT_WEIGHT_SUFFIXES:
+                    experts_weights = []
+                    for e in range(self.args.num_experts):
+                        key = f"{prefix}.experts.{e}.{n}.{suffix}"
+                        if key in weights:
+                            experts_weights.append(weights.pop(key))
 
-                if experts_weights:
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
-                        experts_weights, axis=0
-                    )
+                    if experts_weights:
+                        weights[f"{prefix}.switch_mlp.{n}.{suffix}"] = mx.stack(
+                            experts_weights, axis=0
+                        )
         return weights
 
     @property
